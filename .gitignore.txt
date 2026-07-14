@@ -1,0 +1,14 @@
+# Données locales — ne jamais versionner
+rss_local.db
+synthese_*.txt
+
+# Python portable embarqué
+python/
+
+# Fichiers Python
+__pycache__/
+*.pyc
+
+# Fichiers système
+.DS_Store
+Thumbs.db
