@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head><title>Flux de démonstration</title></head>
+  <body>
+    <outline text="Actualités" title="Actualités">
+      <outline text="France Info" title="France Info" type="rss"
+        xmlUrl="https://www.francetvinfo.fr/titres.rss"/>
+      <outline text="Le Monde" title="Le Monde" type="rss"
+        xmlUrl="https://www.lemonde.fr/rss/une.xml"/>
+    </outline>
+    <outline text="Technologie" title="Technologie">
+      <outline text="Next" title="Next" type="rss"
+        xmlUrl="https://next.ink/feed/"/>
+    </outline>
+  </body>
+</opml>
