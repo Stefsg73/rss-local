@@ -6,17 +6,23 @@ Lecteur et agrégateur de flux RSS **100 % local**, en un seul fichier Python,
 Conçu pour les environnements verrouillés (poste professionnel sans droits admin,
 impossibilité d'installer Docker, FreshRSS ou toute application classique).
 
+**V2 — Décembre 2024** : gestion des flux, tri/regroupement par média,
+partage d'articles (mail/WhatsApp), synthèse repliable, prompts d'analyse éditables.
+
 ## ✨ Fonctionnalités
 
 - Agrégation de flux **RSS 2.0 et Atom** (collecte parallèle, dédoublonnage automatique)
 - **Import / export OPML** (compatible Feedly, Inoreader, FreshRSS…)
 - Interface web locale dans votre navigateur (`http://localhost:8765`)
-- Navigation par **date**, résumés d'articles, liens directs vers les sources
+- Navigation par **date**, tri (chronologique, par média), résumés d'articles
+- **Gestion des flux** : ajouter/supprimer dans l'interface, conserver ou purger les archives
+- **Partage d'articles** : mail, WhatsApp, copie du lien
 - **Export JSON et CSV** des articles d'une journée (CSV compatible Excel FR, séparateur `;`)
 - **Envoi vers un webhook n8n** (optionnel) pour automatisation
 - **Analyse IA en entonnoir** (optionnel) : tri thématique par Claude Haiku,
-  synthèse éditoriale par Claude Sonnet — architecture économe en tokens
+  synthèse éditoriale par Claude Sonnet — **prompts personnalisables** selon votre ligne éditoriale
 - Stockage dans une base **SQLite** locale (un simple fichier `rss_local.db`)
+- **Synthèse repliable** : masquer/afficher d'un clic, mémorisation par jo
 
 ## 🔒 Confidentialité
 
@@ -139,4 +145,4 @@ synthese_*.txt     (créés par l'analyse IA) — non versionnés
 
 ## 📜 Licence
 
-MIT — voir le fichier `LICENSE`.
+MIT — voir le fichier `LICENSE`
