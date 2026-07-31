@@ -1,23 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-<<<<<<< HEAD
-RSSLocal v2 — Lecteur/agrégateur RSS 100 % local + analyse IA en entonnoir.
+RSSLocal v4 — Lecteur/agrégateur RSS 100 % local + analyse IA simplifiée.
 Aucun droit admin, aucune dépendance externe (stdlib Python uniquement).
 Usage : python3 rss_local.py   puis ouvrir http://localhost:8765
 
-Nouveautés v2 :
-- Gestion des flux dans l'interface (ajout unitaire, suppression, purge optionnelle)
-- Tri des articles (date ↓/↑) et vue dépliante par média
-- Partage d'article : mail, WhatsApp, copie du lien
-- Synthèse éditoriale repliable/masquable
-- Prompts d'analyse affichables et modifiables (sauvegardés en base)
-- Correctif SSL macOS intégré
-=======
-RSSLocal v3 — Lecteur/agrégateur RSS 100 % local + analyse IA simplifiée.
-Aucun droit admin, aucune dépendance externe (stdlib Python uniquement).
-Usage : python3 rss_local.py   puis ouvrir http://localhost:8765
+Nouveautés v4 :
+- Suppression de flux par lots (cases à cocher + bouton, avec la même
+  double confirmation purge/conservation que la suppression unitaire)
+- Import OPML avec aperçu avant action : choix entre ajout seul ou
+  synchronisation complète (flux absents du fichier proposés à la
+  suppression, avec écran de confirmation détaillé)
+- Marquage lu / non-lu des articles (filtre dédié)
+- Recherche plein texte (titre + résumé) sur la période affichée
+- Filtre d'affichage et d'export par flux spécifiques (au lieu de tout/rien)
+- Mots-clés à surveiller : surlignage des articles correspondants
+- Édition en place d'un flux existant (titre, catégorie)
+- Badge d'alerte ⚠️ sur les flux en échec de rafraîchissement récurrent
 
-Nouveautés v3 :
+⚠️ IMPORTANT — changement de schéma de base de données :
+Cette version ajoute des colonnes aux tables `feeds` et `articles`.
+Supprimez (ou renommez) votre ancien rss_local.db avant le premier lancement
+de cette V4 : il sera recréé automatiquement avec le nouveau schéma.
+
+Nouveautés v3 (rappel) :
 - Sélection de période : aujourd'hui / 7 jours / 30 jours / personnalisée
 - Analyse simplifiée : un seul modèle (Sonnet), un seul prompt éditable
 - Destinataire mail par défaut (réglage dans l'interface)
@@ -25,18 +30,13 @@ Nouveautés v3 :
 - Statut de rafraîchissement sur une ligne (détail dépliable)
 - Purge automatique par ancienneté (CONSERVER_JOURS, articles + synthèses)
 - Purges manuelles : totale, par média, par période
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 """
 import sqlite3, json, csv, io, re, threading, webbrowser, ssl, os
 import urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-<<<<<<< HEAD
-from datetime import datetime, timezone
-=======
 from datetime import datetime, timezone, timedelta
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -44,53 +44,10 @@ from concurrent.futures import ThreadPoolExecutor
 PORT = 8765
 DB_PATH = "rss_local.db"
 WEBHOOK_N8N = ""     # ex: "http://localhost:5678/webhook/rss" — vide si inutilisé
-<<<<<<< HEAD
-USER_AGENT = "Mozilla/5.0 (RSSLocal/2.0; lecteur personnel)"
-TIMEOUT = 15
-
-# --- Analyse IA (laisser API_KEY vide pour désactiver) ---
-API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # ou collez la clé ici : "sk-ant-..."
-MODELE_TRI = "claude-haiku-4-5-20251001"
-MODELE_SYNTHESE = "claude-sonnet-4-6"
-TAILLE_LOT = 20
-# -----------------------------------
-
-# ---------- CONTEXTE SSL (correctif macOS) ----------
-def make_ssl_context():
-    try:
-        import certifi
-        return ssl.create_default_context(cafile=certifi.where())
-    except ImportError:
-        pass
-    for path in ("/etc/ssl/cert.pem",
-                 "/etc/ssl/certs/ca-certificates.crt",
-                 "/private/etc/ssl/cert.pem"):
-        if os.path.exists(path):
-            return ssl.create_default_context(cafile=path)
-    return ssl.create_default_context()
-
-SSL_CTX = make_ssl_context()
-# ----------------------------------------------------
-
-# ---------- PROMPTS PAR DÉFAUT ----------
-PROMPT_TRI_DEFAUT = (
-    "Tu es un assistant de veille pour un journaliste. "
-    "Classe les articles suivants par grand thème (politique, économie, "
-    "santé, culture, sport, autre). Pour chaque thème, liste les titres "
-    "et signale d'un ⭐ les 2-3 articles les plus notables. "
-    "Sois concis, pas de commentaire superflu.")
-
-PROMPT_SYNTHESE_DEFAUT = (
-    "Tu es l'assistant de veille d'un journaliste généraliste. "
-    "Voici les tris thématiques des articles du jour, réalisés par lots. "
-    "Rédige une synthèse éditoriale structurée : "
-    "1) les 5 faits marquants du jour, 2) un panorama par thème, "
-    "3) trois angles d'articles possibles. Style factuel et neutre.")
-# ----------------------------------------
-=======
-USER_AGENT = "Mozilla/5.0 (RSSLocal/3.0; lecteur personnel)"
+USER_AGENT = "Mozilla/5.0 (RSSLocal/4.0; lecteur personnel)"
 TIMEOUT = 15
 CONSERVER_JOURS = 14  # purge auto : articles et synthèses plus vieux supprimés
+SEUIL_ECHECS_ALERTE = 3  # nombre d'échecs consécutifs avant badge ⚠️ sur un flux
 
 # --- Analyse IA (laisser API_KEY vide pour désactiver) ---
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # ou collez la clé ici : "sk-ant-..."
@@ -133,28 +90,25 @@ PROMPT_ANALYSE_DEFAUT = (
     "(politique, économie, santé, culture, sport, local, autre), "
     "3) trois angles d'articles possibles. Style factuel et neutre, concis.")
 # ------------------------------------------------
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 
 # ==================== BASE DE DONNÉES ====================
 
 def db():
     c = sqlite3.connect(DB_PATH)
     c.execute("""CREATE TABLE IF NOT EXISTS feeds(
-        id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, category TEXT DEFAULT '')""")
+        id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, category TEXT DEFAULT '',
+        echecs INTEGER DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS articles(
         id INTEGER PRIMARY KEY, feed_id INTEGER, guid TEXT UNIQUE,
-        title TEXT, link TEXT, summary TEXT, published TEXT, fetched TEXT)""")
+        title TEXT, link TEXT, summary TEXT, published TEXT, fetched TEXT,
+        lu INTEGER DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS syntheses(
         id INTEGER PRIMARY KEY, jour TEXT UNIQUE, texte TEXT, cree TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS reglages(
         cle TEXT PRIMARY KEY, valeur TEXT)""")
     return c
 
-<<<<<<< HEAD
-def get_reglage(cle, defaut):
-=======
 def get_reglage(cle, defaut=""):
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
     c = db()
     row = c.execute("SELECT valeur FROM reglages WHERE cle=?", (cle,)).fetchone()
     c.close()
@@ -165,8 +119,6 @@ def set_reglage(cle, valeur):
     c.execute("INSERT OR REPLACE INTO reglages(cle, valeur) VALUES(?,?)", (cle, valeur))
     c.commit(); c.close()
 
-<<<<<<< HEAD
-=======
 # ==================== PURGES ====================
 
 def purge_auto():
@@ -206,7 +158,6 @@ def purge_periode(start, end):
     c.commit(); c.close()
     return True, f"{n} articles supprimés sur la période {start} → {end}."
 
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 # ==================== COLLECTE DES FLUX ====================
 
 def parse_date(s):
@@ -231,10 +182,6 @@ def fetch_feed(feed_id, url):
         root = ET.fromstring(data)
     except ET.ParseError as e:
         return [], f"XML invalide: {e}"
-<<<<<<< HEAD
-
-=======
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
     ns = {"atom": "http://www.w3.org/2005/Atom"}
     items = []
     for it in root.iter("item"):  # RSS 2.0
@@ -258,10 +205,7 @@ def fetch_feed(feed_id, url):
     return items, None
 
 def refresh_all():
-<<<<<<< HEAD
-=======
     purge_auto()  # nettoyage silencieux des articles/synthèses trop vieux
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
     c = db()
     feeds = c.execute("SELECT id, url, title FROM feeds").fetchall()
     def work(f):
@@ -271,17 +215,13 @@ def refresh_all():
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(work, feeds))
     now = datetime.now(timezone.utc).isoformat()
-<<<<<<< HEAD
-    new_count, report = 0, []
-    for fid, ftitle, items, err in results:
-        if err:
-=======
     new_count, report, erreurs = 0, [], 0
     for fid, ftitle, items, err in results:
         if err:
             erreurs += 1
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
+            c.execute("UPDATE feeds SET echecs = echecs + 1 WHERE id=?", (fid,))
             report.append(f"⚠ {ftitle} : {err}"); continue
+        c.execute("UPDATE feeds SET echecs = 0 WHERE id=?", (fid,))
         for guid, title, link, desc, pub in items:
             try:
                 c.execute("""INSERT OR IGNORE INTO articles
@@ -293,23 +233,20 @@ def refresh_all():
             except Exception: pass
         report.append(f"✓ {ftitle} : {len(items)} articles")
     c.commit(); c.close()
-<<<<<<< HEAD
-    return new_count, report
-=======
     return new_count, erreurs, report
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 
 # ==================== GESTION DES FLUX ====================
 
 def list_feeds():
     c = db()
-    rows = c.execute("""SELECT f.id, f.title, f.url, f.category,
+    rows = c.execute("""SELECT f.id, f.title, f.url, f.category, f.echecs,
                         COUNT(a.id) FROM feeds f
                         LEFT JOIN articles a ON a.feed_id = f.id
                         GROUP BY f.id ORDER BY f.category, f.title""").fetchall()
     c.close()
-    return [{"id": r[0], "titre": r[1], "url": r[2],
-             "categorie": r[3], "articles": r[4]} for r in rows]
+    return [{"id": r[0], "titre": r[1], "url": r[2], "categorie": r[3],
+             "echecs": r[4], "alerte": r[4] >= SEUIL_ECHECS_ALERTE,
+             "articles": r[5]} for r in rows]
 
 def add_feed(url, title="", category=""):
     if not url or not url.startswith(("http://", "https://")):
@@ -320,6 +257,17 @@ def add_feed(url, title="", category=""):
     n = c.execute("SELECT changes()").fetchone()[0]
     c.commit(); c.close()
     return (True, "Flux ajouté.") if n else (False, "Ce flux existe déjà.")
+
+def edit_feed(feed_id, titre, categorie):
+    c = db()
+    row = c.execute("SELECT title FROM feeds WHERE id=?", (feed_id,)).fetchone()
+    if not row:
+        c.close(); return False, "Flux introuvable."
+    nouveau_titre = (titre or "").strip() or row[0]
+    c.execute("UPDATE feeds SET title=?, category=? WHERE id=?",
+              (nouveau_titre, (categorie or "").strip(), feed_id))
+    c.commit(); c.close()
+    return True, f"Flux « {nouveau_titre} » mis à jour."
 
 def delete_feed(feed_id, purge=False):
     c = db()
@@ -333,25 +281,82 @@ def delete_feed(feed_id, purge=False):
     return True, f"Flux « {row[0]} » supprimé" + (" (articles effacés)." if purge
                                                   else " (articles conservés).")
 
+def delete_feeds_bulk(ids, purge=False):
+    ids = [int(i) for i in (ids or [])]
+    if not ids:
+        return False, "Aucun flux sélectionné."
+    c = db()
+    q = ",".join("?" * len(ids))
+    rows = c.execute(f"SELECT id, title FROM feeds WHERE id IN ({q})", ids).fetchall()
+    if not rows:
+        c.close(); return False, "Aucun flux correspondant trouvé."
+    if purge:
+        c.execute(f"DELETE FROM articles WHERE feed_id IN ({q})", ids)
+    c.execute(f"DELETE FROM feeds WHERE id IN ({q})", ids)
+    c.commit(); c.close()
+    noms = ", ".join(f"« {r[1]} »" for r in rows)
+    return True, (f"{len(rows)} flux supprimés ({noms})"
+                  + (" — articles effacés." if purge else " — articles conservés."))
+
 # ==================== OPML ====================
 
-def import_opml(xml_text):
+def normalize_url(u):
+    """Normalise une URL pour comparaison (schéma, casse, barre finale)
+    afin d'éviter les faux positifs lors d'une synchronisation OPML."""
+    u = (u or "").strip().lower()
+    u = re.sub(r"^https?://", "", u)
+    return u.rstrip("/")
+
+def opml_outlines(xml_text):
+    """Retourne une liste de (url, titre, catégorie) à partir d'un texte OPML."""
     root = ET.fromstring(xml_text)
-    c = db(); n = 0
+    out = []
     def walk(node, cat=""):
-        nonlocal n
         for o in node.findall("outline"):
             url = o.get("xmlUrl")
             if url:
-                c.execute("INSERT OR IGNORE INTO feeds(url,title,category) VALUES(?,?,?)",
-                          (url, o.get("title") or o.get("text") or url, cat))
-                n += c.execute("SELECT changes()").fetchone()[0]
+                out.append((url, o.get("title") or o.get("text") or url, cat))
             else:
                 walk(o, o.get("title") or o.get("text") or cat)
     body = root.find("body")
     if body is not None: walk(body)
+    return out
+
+def import_opml(xml_text):
+    outlines = opml_outlines(xml_text)
+    c = db(); n = 0
+    for url, titre, cat in outlines:
+        c.execute("INSERT OR IGNORE INTO feeds(url,title,category) VALUES(?,?,?)",
+                  (url, titre, cat))
+        n += c.execute("SELECT changes()").fetchone()[0]
     c.commit(); c.close()
     return n
+
+def opml_preview(xml_text):
+    """Prévisualise l'effet d'un import OPML sans toucher à la base :
+    renvoie les nouveaux flux à ajouter et les flux existants absents
+    du fichier (candidats à la suppression en mode synchronisation)."""
+    outlines = opml_outlines(xml_text)
+    urls_fichier = {normalize_url(u) for u, t, cat in outlines}
+    c = db()
+    existants = c.execute("SELECT id, title, url, category FROM feeds").fetchall()
+    c.close()
+    urls_existantes = {normalize_url(u) for _, _, u, _ in existants}
+    nouveaux = [{"url": u, "titre": t, "categorie": cat} for u, t, cat in outlines
+                if normalize_url(u) not in urls_existantes]
+    a_supprimer = [{"id": r[0], "titre": r[1], "url": r[2], "categorie": r[3]}
+                   for r in existants if normalize_url(r[2]) not in urls_fichier]
+    return nouveaux, a_supprimer
+
+def opml_appliquer(xml_text, supprimer_ids=None, purge=False):
+    """Applique un import OPML : ajoute toujours les nouveaux flux, et
+    supprime en plus les flux listés dans supprimer_ids (mode synchronisation)."""
+    n = import_opml(xml_text)
+    msg_sup = ""
+    if supprimer_ids:
+        ok, msg = delete_feeds_bulk(supprimer_ids, purge)
+        if ok: msg_sup = " — " + msg
+    return n, msg_sup
 
 def export_opml():
     c = db()
@@ -365,18 +370,7 @@ def export_opml():
     lines.append("</body></opml>")
     return "\n".join(lines)
 
-<<<<<<< HEAD
-# ==================== EXPORTS / WEBHOOK ====================
-
-def articles_of_day(day=None):
-    day = day or datetime.now().strftime("%Y-%m-%d")
-    c = db()
-    rows = c.execute("""SELECT a.title, a.link, a.summary, a.published, f.title, f.category
-           FROM articles a JOIN feeds f ON f.id=a.feed_id
-           WHERE substr(a.published,1,10)=?
-           ORDER BY a.published DESC""", (day,)).fetchall()
-=======
-# ==================== PÉRIODES / EXPORTS / WEBHOOK ====================
+# ==================== ARTICLES : PÉRIODES / LECTURE / EXPORTS / WEBHOOK ====================
 
 def borne_periode(start, end):
     """Normalise les bornes ; par défaut : aujourd'hui."""
@@ -386,25 +380,28 @@ def borne_periode(start, end):
     if start > end: start, end = end, start
     return start, end
 
-def articles_periode(start=None, end=None):
+def articles_periode(start=None, end=None, feed_ids=None):
     start, end = borne_periode(start, end)
     c = db()
-    rows = c.execute("""SELECT a.title, a.link, a.summary, a.published, f.title, f.category
+    q = """SELECT a.id, a.title, a.link, a.summary, a.published, f.title, f.category, a.lu
            FROM articles a JOIN feeds f ON f.id=a.feed_id
-           WHERE substr(a.published,1,10) >= ? AND substr(a.published,1,10) <= ?
-           ORDER BY a.published DESC""", (start, end)).fetchall()
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
+           WHERE substr(a.published,1,10) >= ? AND substr(a.published,1,10) <= ?"""
+    params = [start, end]
+    if feed_ids:
+        q += f" AND a.feed_id IN ({','.join('?' * len(feed_ids))})"
+        params += list(feed_ids)
+    q += " ORDER BY a.published DESC"
+    rows = c.execute(q, params).fetchall()
     c.close()
-    return [{"titre": r[0], "lien": r[1], "resume": r[2], "date": r[3],
-             "flux": r[4], "categorie": r[5]} for r in rows]
+    return [{"id": r[0], "titre": r[1], "lien": r[2], "resume": r[3], "date": r[4],
+             "flux": r[5], "categorie": r[6], "lu": bool(r[7])} for r in rows]
 
-<<<<<<< HEAD
-def send_webhook(day=None):
-    if not WEBHOOK_N8N:
-        return False, "Aucune URL de webhook configurée (variable WEBHOOK_N8N)."
-    payload = json.dumps({"jour": day or datetime.now().strftime("%Y-%m-%d"),
-                          "articles": articles_of_day(day)}, ensure_ascii=False).encode("utf-8")
-=======
+def marquer_lu(article_id, lu):
+    c = db()
+    c.execute("UPDATE articles SET lu=? WHERE id=?", (1 if lu else 0, article_id))
+    c.commit(); c.close()
+    return True
+
 def send_webhook(start=None, end=None):
     if not WEBHOOK_N8N:
         return False, "Aucune URL de webhook configurée (variable WEBHOOK_N8N)."
@@ -412,7 +409,6 @@ def send_webhook(start=None, end=None):
     payload = json.dumps({"periode": f"{start}_{end}",
                           "articles": articles_periode(start, end)},
                          ensure_ascii=False).encode("utf-8")
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
     req = urllib.request.Request(WEBHOOK_N8N, data=payload,
                                  headers={"Content-Type": "application/json",
                                           "User-Agent": USER_AGENT})
@@ -422,15 +418,9 @@ def send_webhook(start=None, end=None):
     except Exception as e:
         return False, f"Échec webhook: {e}"
 
-<<<<<<< HEAD
-# ==================== ANALYSE IA EN ENTONNOIR ====================
-
-def appel_claude(modele, prompt, max_tokens=1024):
-=======
 # ==================== ANALYSE IA (Sonnet seul, prompt unique) ====================
 
 def appel_claude(modele, prompt, max_tokens=2500):
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps({
@@ -441,44 +431,15 @@ def appel_claude(modele, prompt, max_tokens=2500):
         headers={"x-api-key": API_KEY,
                  "anthropic-version": "2023-06-01",
                  "content-type": "application/json"})
-<<<<<<< HEAD
-    with urllib.request.urlopen(req, timeout=120, context=SSL_CTX) as r:
-        rep = json.loads(r.read())
-    return rep["content"][0]["text"]
-
-def analyser_jour(day=None):
-=======
     with urllib.request.urlopen(req, timeout=180, context=SSL_CTX) as r:
         rep = json.loads(r.read())
     return rep["content"][0]["text"]
 
 def analyser_periode(start=None, end=None):
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
     if not API_KEY:
         return False, ("Aucune clé API configurée. Renseignez API_KEY dans rss_local.py "
                        "ou la variable d'environnement ANTHROPIC_API_KEY "
                        "(clé + crédits sur console.anthropic.com, Plans & Billing).")
-<<<<<<< HEAD
-    day = day or datetime.now().strftime("%Y-%m-%d")
-    arts = articles_of_day(day)
-    if not arts:
-        return False, f"Aucun article pour le {day}. Rafraîchissez d'abord les flux."
-
-    prompt_tri = get_reglage("prompt_tri", PROMPT_TRI_DEFAUT)
-    prompt_synthese = get_reglage("prompt_synthese", PROMPT_SYNTHESE_DEFAUT)
-
-    try:
-        lots = [arts[i:i+TAILLE_LOT] for i in range(0, len(arts), TAILLE_LOT)]
-        tris = []
-        for lot in lots:
-            liste = "\n".join(
-                f"- [{a['flux']}] {a['titre']} — {a['resume'][:150]}" for a in lot)
-            tris.append(appel_claude(MODELE_TRI,
-                prompt_tri + "\n\n" + liste, max_tokens=800))
-        synthese = appel_claude(MODELE_SYNTHESE,
-            prompt_synthese + f"\n\n(Journée du {day}, {len(arts)} articles.)\n\n"
-            + "\n---\n".join(tris), max_tokens=2000)
-=======
     start, end = borne_periode(start, end)
     cle_periode = start if start == end else f"{start}_{end}"
     arts = articles_periode(start, end)
@@ -492,7 +453,6 @@ def analyser_periode(start=None, end=None):
     try:
         synthese = appel_claude(MODELE_ANALYSE,
             prompt + f"\n\n(Période : {libelle} — {len(arts)} articles.)\n\n" + liste)
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:300]
         return False, f"Erreur API (HTTP {e.code}) : {detail}"
@@ -501,23 +461,6 @@ def analyser_periode(start=None, end=None):
 
     c = db()
     c.execute("INSERT OR REPLACE INTO syntheses(jour, texte, cree) VALUES(?,?,?)",
-<<<<<<< HEAD
-              (day, synthese, datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close()
-    try:
-        with open(f"synthese_{day}.txt", "w", encoding="utf-8") as f:
-            f.write(f"Synthèse RSSLocal — {day}\n{'='*40}\n\n{synthese}")
-    except Exception:
-        pass
-    return True, synthese
-
-def synthese_existante(day):
-    c = db()
-    row = c.execute("SELECT texte FROM syntheses WHERE jour=?", (day,)).fetchone()
-    c.close()
-    return row[0] if row else None
-
-=======
               (cle_periode, synthese, datetime.now(timezone.utc).isoformat()))
     c.commit(); c.close()
     return True, synthese
@@ -541,7 +484,6 @@ def synthese_markdown(start, end):
           f"modèle : {MODELE_ANALYSE}*\n\n---\n\n{texte}\n")
     return md, libelle
 
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 # ==================== INTERFACE WEB ====================
 
 PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
@@ -552,57 +494,46 @@ h1{font-size:1.4rem} .bar{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;alig
 button,a.btn,label.btn{padding:8px 14px;border:1px solid #bbb;border-radius:8px;background:#fff;cursor:pointer;text-decoration:none;color:#222;font-size:.9rem}
 button:hover,a.btn:hover,label.btn:hover{background:#eee}
 button.ia{background:#4a3b8f;color:#fff;border-color:#4a3b8f}button.ia:hover{background:#5c4bb0}
-<<<<<<< HEAD
-select,input[type=date],input[type=text]{padding:6px;border-radius:8px;border:1px solid #bbb;font-size:.9rem}
-=======
 button.danger{border-color:#c0392b;color:#c0392b}button.danger:hover{background:#fdf0ee}
 select,input[type=date],input[type=text],input[type=email]{padding:6px;border-radius:8px;border:1px solid #bbb;font-size:.9rem}
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 .art{background:#fff;border:1px solid #e2e2e0;border-radius:10px;padding:12px 16px;margin:10px 0}
 .art h3{margin:0 0 4px;font-size:1.02rem}.art .meta{color:#777;font-size:.8rem}
 .art p{margin:6px 0 0;font-size:.9rem;color:#444}
+.art.lu{opacity:.5}
+.art.surligne{border-left:4px solid #e6b800;background:#fffdf2}
 .share{margin-top:6px;display:flex;gap:6px}
 .share a,.share button{padding:3px 8px;font-size:.8rem;border:1px solid #ddd;border-radius:6px;background:#fafafa;cursor:pointer;text-decoration:none;color:#333}
-<<<<<<< HEAD
-#status{white-space:pre-wrap;font-size:.8rem;color:#555;background:#eee;padding:8px;border-radius:8px;display:none;margin:8px 0}
-=======
+.luBtn{margin-left:8px;padding:2px 8px;font-size:.75rem;border:1px solid #ccc;border-radius:6px;background:#fafafa;cursor:pointer}
 #status{font-size:.85rem;color:#333;background:#eee;padding:8px 12px;border-radius:8px;display:none;margin:8px 0}
 #status details{margin-top:6px}#status summary{cursor:pointer;color:#666;font-size:.8rem}
 #status pre{white-space:pre-wrap;font-size:.78rem;color:#555;margin:6px 0 0}
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 details.media{background:#fff;border:1px solid #e2e2e0;border-radius:10px;margin:8px 0;padding:4px 12px}
 details.media summary{cursor:pointer;font-weight:600;padding:8px 0}
 details.media .art{border:none;border-top:1px solid #eee;border-radius:0;margin:0}
 #synthbox{background:#fffbe8;border:1px solid #e6d98a;border-radius:10px;margin:12px 0;display:none}
 #synthhead{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;cursor:pointer;font-weight:600}
-<<<<<<< HEAD
-#synthbody{white-space:pre-wrap;padding:0 16px 16px;font-size:.92rem}
-=======
 #synthbody{white-space:pre-wrap;padding:0 16px 12px;font-size:.92rem}
 #synthactions{padding:0 16px 14px;display:flex;gap:8px}
 #synthactions a,#synthactions button{padding:4px 10px;font-size:.8rem;border:1px solid #d8c96a;border-radius:6px;background:#fff;cursor:pointer;text-decoration:none;color:#333}
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 #synthclose{border:none;background:none;font-size:1.1rem;cursor:pointer;color:#8a7b2e}
 .panel{background:#fff;border:1px solid #ccc;border-radius:10px;padding:16px;margin:12px 0;display:none}
 .panel h2{font-size:1.05rem;margin:0 0 10px}
-.feedrow{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #eee;font-size:.9rem;gap:8px}
+.panel h3{font-size:.98rem;margin:10px 0 6px}
+.feedrow{display:flex;justify-content:space-between;align-items:flex-start;padding:6px 0;border-bottom:1px solid #eee;font-size:.9rem;gap:8px}
 .feedrow .finfo{flex:1;min-width:0}.feedrow .furl{color:#999;font-size:.75rem;word-break:break-all}
-.feedrow button{padding:4px 10px;font-size:.8rem}
+.feedrow button{padding:4px 10px;font-size:.8rem;white-space:nowrap}
+.feedrow input[type=checkbox]{margin-top:4px}
+.editbox{display:flex;gap:6px;flex-wrap:wrap}
+.editbox input{flex:1;min-width:100px}
+.badge{cursor:help}
 textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb;border-radius:8px;padding:8px;font-size:.85rem;font-family:inherit}
-<<<<<<< HEAD
-.addrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
-.addrow input{flex:1;min-width:120px}
-</style></head><body>
-<h1>📰 RSSLocal v2 — agrégateur local</h1>
-<div class="bar">
-<button onclick="refresh()">🔄 Rafraîchir</button>
-<label>Jour : <input type="date" id="day" onchange="load()"></label>
-=======
 .addrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.addrow input{flex:1;min-width:120px}
 #customdates{display:none;gap:6px;align-items:center}
 .reglrow{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
+#filtrefluxlist label{display:block;padding:2px 0;font-size:.9rem}
+#opmlpreview{display:none}
 </style></head><body>
-<h1>📰 RSSLocal v3 — agrégateur local</h1>
+<h1>📰 RSSLocal v4 — agrégateur local</h1>
 <div class="bar">
 <button onclick="refresh()">🔄 Rafraîchir</button>
 <select id="periode" onchange="periodeChange()">
@@ -613,25 +544,23 @@ textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb
 </select>
 <span id="customdates">du <input type="date" id="dstart"> au <input type="date" id="dend">
 <button onclick="load()">OK</button></span>
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
-<select id="tri" onchange="load()">
+<select id="tri" onchange="render()">
 <option value="desc">Plus récents d'abord</option>
 <option value="asc">Plus anciens d'abord</option>
 <option value="media">Grouper par média</option>
 </select>
-<<<<<<< HEAD
-<button class="ia" onclick="analyse()">🧠 Analyser la journée</button>
-</div>
-<div class="bar">
-<button onclick="toggle('pfeeds');loadFeeds()">⚙️ Gérer les flux</button>
-<button onclick="toggle('pprompts');loadPrompts()">🧠 Réglages de l'analyse</button>
-=======
+<select id="lufiltre" onchange="render()">
+<option value="tous">Tous (lus et non lus)</option>
+<option value="nonlu">Non lus seulement</option>
+<option value="lu">Lus seulement</option>
+</select>
+<input type="text" id="recherche" placeholder="🔎 Rechercher…" oninput="render()" style="min-width:140px">
 <button class="ia" onclick="analyse()">🧠 Analyser la période</button>
 </div>
 <div class="bar">
 <button onclick="toggle('pfeeds');loadFeeds()">⚙️ Flux</button>
 <button onclick="toggle('preglages');loadReglages()">🛠 Réglages</button>
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
+<button onclick="toggle('pfiltreflux');loadFiltreFlux()">🔍 Filtrer par flux</button>
 <a class="btn" id="ejson" href="#">⬇ JSON</a>
 <a class="btn" id="ecsv" href="#">⬇ CSV</a>
 <a class="btn" href="/export/opml">⬇ OPML</a>
@@ -639,10 +568,14 @@ textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb
 <label class="btn">📁 Importer OPML<input type="file" id="opml" style="display:none" onchange="upload(this)"></label>
 </div>
 <div id="status"></div>
+<div class="panel" id="opmlpreview"></div>
 
 <div class="panel" id="pfeeds">
 <h2>⚙️ Gérer les flux</h2>
 <div id="feedlist"></div>
+<div class="bar">
+<button class="danger" onclick="delFeedsBulk()">🗑 Supprimer la sélection</button>
+</div>
 <div class="addrow">
 <input type="text" id="furl" placeholder="URL du flux (https://…)">
 <input type="text" id="ftitre" placeholder="Titre (optionnel)">
@@ -651,23 +584,25 @@ textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb
 </div>
 </div>
 
-<<<<<<< HEAD
-<div class="panel" id="pprompts">
-<h2>🧠 Réglages de l'analyse</h2>
-<p style="font-size:.85rem;color:#666">Prompt de <b>tri</b> (envoyé à Haiku, par lots d'articles) :</p>
-<textarea id="ptri"></textarea>
-<p style="font-size:.85rem;color:#666">Prompt de <b>synthèse</b> (envoyé à Sonnet, avec les tris) :</p>
-<textarea id="psynth"></textarea>
+<div class="panel" id="pfiltreflux">
+<h2>🔍 Filtrer l'affichage et les exports par flux</h2>
+<p style="font-size:.85rem;color:#666;margin-top:0">Aucune case cochée = tous les flux affichés et exportés.</p>
 <div class="bar">
-<button onclick="savePrompts()">💾 Enregistrer</button>
-<button onclick="resetPrompts()">↩️ Rétablir les prompts par défaut</button>
+<button onclick="filtreFluxTout(true)">Tout cocher</button>
+<button onclick="filtreFluxTout(false)">Tout décocher</button>
 </div>
-=======
+<div id="filtrefluxlist"></div>
+</div>
+
 <div class="panel" id="preglages">
 <h2>🛠 Réglages</h2>
 <div class="reglrow"><label>✉️ Destinataire mail par défaut :</label>
 <input type="email" id="rmail" placeholder="prenom.nom@exemple.fr" style="flex:1;min-width:200px">
 <button onclick="saveMail()">💾</button></div>
+<div class="reglrow"><label>🔎 Mots-clés à surveiller (séparés par des virgules) :</label>
+<input type="text" id="rmots" placeholder="ex: budget, grève, élection" style="flex:1;min-width:200px">
+<button onclick="saveMots()">💾</button></div>
+<p style="font-size:.8rem;color:#888;margin-top:-4px">Les articles correspondants sont surlignés dans la liste (aucune notification).</p>
 <p style="font-size:.85rem;color:#666;margin-bottom:4px">🧠 Prompt d'analyse (envoyé à Sonnet avec la liste des articles) :</p>
 <textarea id="pana"></textarea>
 <div class="bar">
@@ -681,40 +616,22 @@ textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb
 </div>
 <p style="font-size:.8rem;color:#888">Purge automatique : les articles et synthèses de plus de
 <b>CONSERVER_JOURS</b> jours (réglé dans le script) sont supprimés à chaque rafraîchissement.</p>
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 </div>
 
 <div id="synthbox">
 <div id="synthhead" onclick="foldSynth()"><span id="synthtitle">🧠 Synthèse</span>
 <button id="synthclose" onclick="event.stopPropagation();closeSynth()">✕</button></div>
 <div id="synthbody"></div>
-<<<<<<< HEAD
-=======
 <div id="synthactions">
 <a id="smd" href="#">⬇ Export .md</a>
 <a id="smail" href="#">✉️ Envoyer par mail</a>
 </div>
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 </div>
 <div id="list"></div>
 
 <script>
-<<<<<<< HEAD
-const day=document.getElementById('day');day.value=new Date().toISOString().slice(0,10);
-let synthHidden={};
-
-function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
-function links(){document.getElementById('ejson').href='/export/json?day='+day.value;
-document.getElementById('ecsv').href='/export/csv?day='+day.value;}
-function toggle(id){const p=document.getElementById(id);
-p.style.display=p.style.display==='block'?'none':'block';}
-function show(t){const s=document.getElementById('status');s.style.display='block';s.textContent=t;}
-
-function artHTML(x){
-const txt=encodeURIComponent(x.titre+' — '+x.lien);
-const mail='mailto:?subject='+encodeURIComponent(x.titre)+'&body='+txt;
-=======
-let synthHidden={};let mailDefaut='';
+let synthHidden={};let mailDefaut='';let motsCles=[];let articlesCache=[];
+let fluxFiltre=new Set();let xmlEnAttente='';
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
 function fmt(d){return d.toISOString().slice(0,10);}
 function bornes(){
@@ -728,7 +645,9 @@ function periodeChange(){
 document.getElementById('customdates').style.display=
 document.getElementById('periode').value==='perso'?'inline-flex':'none';
 if(document.getElementById('periode').value!=='perso')load();}
-function qs(){const[s,e]=bornes();return'start='+s+'&end='+e;}
+function qs(){const[s,e]=bornes();let q='start='+s+'&end='+e;
+if(fluxFiltre.size)q+='&feeds='+[...fluxFiltre].join(',');
+return q;}
 function links(){document.getElementById('ejson').href='/export/json?'+qs();
 document.getElementById('ecsv').href='/export/csv?'+qs();
 document.getElementById('smd').href='/export/md?'+qs();}
@@ -740,41 +659,44 @@ s.innerHTML=esc(t)+(detail?'<details><summary>voir le détail</summary><pre>'+es
 function artHTML(x){
 const txt=encodeURIComponent(x.titre+' — '+x.lien);
 const mail='mailto:'+encodeURIComponent(mailDefaut)+'?subject='+encodeURIComponent(x.titre)+'&body='+txt;
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 const wa='https://wa.me/?text='+txt;
-return `<div class="art"><h3><a href="${esc(x.lien)}" target="_blank">${esc(x.titre)}</a></h3>
-<div class="meta">${esc(x.flux)} — ${x.date?x.date.slice(0,16).replace('T',' '):''}</div>
+const cible=(x.titre+' '+x.resume).toLowerCase();
+const surligne=motsCles.length&&motsCles.some(k=>cible.includes(k));
+return `<div class="art ${x.lu?'lu':''} ${surligne?'surligne':''}">
+<h3><a href="${esc(x.lien)}" target="_blank">${esc(x.titre)}</a></h3>
+<div class="meta">${esc(x.flux)} — ${x.date?x.date.slice(0,16).replace('T',' '):''}
+<button class="luBtn" onclick="toggleLu(${x.id},${!x.lu})">${x.lu?'✓ Lu':'○ Non lu'}</button></div>
 <p>${esc(x.resume)}</p>
 <div class="share"><a href="${mail}">✉️ Mail</a>
 <a href="${wa}" target="_blank">💬 WhatsApp</a>
 <button onclick="navigator.clipboard.writeText('${esc(x.lien)}');this.textContent='✓ Copié'">📋 Copier</button></div></div>`;}
 
-async function load(){links();
-<<<<<<< HEAD
-const r=await fetch('/api/articles?day='+day.value);let a=await r.json();
+function render(){
+let a=articlesCache.slice();
 const mode=document.getElementById('tri').value;
+const q=(document.getElementById('recherche').value||'').toLowerCase().trim();
+const luF=document.getElementById('lufiltre').value;
+if(q)a=a.filter(x=>(x.titre+' '+x.resume).toLowerCase().includes(q));
+if(luF==='nonlu')a=a.filter(x=>!x.lu);
+if(luF==='lu')a=a.filter(x=>x.lu);
 const list=document.getElementById('list');
-if(!a.length){list.innerHTML='<p>Aucun article ce jour. Importez un OPML ou ajoutez des flux, puis rafraîchissez.</p>';}
-=======
-const r=await fetch('/api/articles?'+qs());let a=await r.json();
-const mode=document.getElementById('tri').value;
-const list=document.getElementById('list');
-if(!a.length){list.innerHTML='<p>Aucun article sur cette période. Importez un OPML ou ajoutez des flux, puis rafraîchissez.</p>';}
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
-else if(mode==='media'){
+if(!a.length){list.innerHTML='<p>Aucun article ne correspond à ces critères.</p>';return;}
+if(mode==='media'){
 const g={};a.forEach(x=>{(g[x.flux]=g[x.flux]||[]).push(x);});
 list.innerHTML=Object.keys(g).sort().map(m=>
 `<details class="media" open><summary>${esc(m)} (${g[m].length})</summary>
 ${g[m].map(artHTML).join('')}</details>`).join('');}
 else{if(mode==='asc')a=a.slice().reverse();
-list.innerHTML=a.map(artHTML).join('');}
-<<<<<<< HEAD
-const s=await fetch('/api/synthese?day='+day.value);const js=await s.json();
-const box=document.getElementById('synthbox');
-if(js.texte&&!synthHidden[day.value]){box.style.display='block';
-document.getElementById('synthtitle').textContent='🧠 Synthèse du '+day.value+' (cliquer pour plier/déplier)';
-document.getElementById('synthbody').textContent=js.texte;}
-=======
+list.innerHTML=a.map(artHTML).join('');}}
+
+async function toggleLu(id,lu){
+await fetch('/api/articles/lu',{method:'POST',body:JSON.stringify({id:id,lu:lu})});
+const idx=articlesCache.findIndex(x=>x.id===id);if(idx>=0)articlesCache[idx].lu=lu;
+render();}
+
+async function load(){links();
+const r=await fetch('/api/articles?'+qs());articlesCache=await r.json();
+render();
 const[s,e]=bornes();
 const sr=await fetch('/api/synthese?'+qs());const js=await sr.json();
 const box=document.getElementById('synthbox');const cle=s+'_'+e;
@@ -785,28 +707,15 @@ const body=encodeURIComponent(js.texte.slice(0,1800));
 document.getElementById('smail').href='mailto:'+encodeURIComponent(mailDefaut)
 +'?subject='+encodeURIComponent('Synthèse RSSLocal — '+(s===e?s:s+' au '+e))
 +'&body='+body;}
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 else{box.style.display='none';}}
 
 function foldSynth(){const b=document.getElementById('synthbody');
 b.style.display=b.style.display==='none'?'block':'none';}
-<<<<<<< HEAD
-function closeSynth(){synthHidden[day.value]=true;
-=======
 function closeSynth(){const[s,e]=bornes();synthHidden[s+'_'+e]=true;
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 document.getElementById('synthbox').style.display='none';}
 
 async function refresh(){show('Rafraîchissement en cours…');
 const r=await fetch('/api/refresh',{method:'POST'});const j=await r.json();
-<<<<<<< HEAD
-show(j.nouveaux+' nouveaux articles\\n'+j.rapport.join('\\n'));load();}
-
-async function analyse(){
-show('🧠 Analyse en cours (tri Haiku, synthèse Sonnet)… 1 à 2 minutes.');
-const r=await fetch('/api/analyse?day='+day.value,{method:'POST'});const j=await r.json();
-if(j.ok){synthHidden[day.value]=false;show('Synthèse générée et sauvegardée (synthese_'+day.value+'.txt).');load();}
-=======
 const ligne=(j.erreurs?'⚠ ':'✓ ')+j.nouveaux+' nouveaux articles'
 +(j.erreurs?' — '+j.erreurs+' flux en erreur':'');
 show(ligne,j.rapport.join('\\n'));load();}
@@ -816,31 +725,86 @@ show('🧠 Analyse en cours (Sonnet)… jusqu\\'à 2 minutes selon le volume.');
 const r=await fetch('/api/analyse?'+qs(),{method:'POST'});const j=await r.json();
 if(j.ok){const[s,e]=bornes();synthHidden[s+'_'+e]=false;
 show('✓ Synthèse générée.');load();}
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 else{show('⚠ '+j.message);}}
 
-async function upload(inp){const t=await inp.files[0].text();
-const r=await fetch('/api/import',{method:'POST',body:t});const j=await r.json();
-show((j.ajoutes||0)+' flux ajoutés. Cliquez sur Rafraîchir.');inp.value='';}
+async function upload(inp){
+xmlEnAttente=await inp.files[0].text();
+const r=await fetch('/api/opml/preview',{method:'POST',body:xmlEnAttente});
+const j=await r.json();inp.value='';
+afficherPreviewOpml(j);}
 
-<<<<<<< HEAD
-async function hook(){const r=await fetch('/api/webhook?day='+day.value,{method:'POST'});
-=======
+function afficherPreviewOpml(j){
+const box=document.getElementById('opmlpreview');
+let html=`<h3>📁 Import OPML — aperçu avant action</h3>`;
+html+=`<p>${j.nouveaux.length} nouveau(x) flux seront ajoutés`
++(j.nouveaux.length?' : '+j.nouveaux.map(x=>esc(x.titre)).join(', '):'')+`.</p>`;
+if(j.a_supprimer&&j.a_supprimer.length){
+html+=`<p>${j.a_supprimer.length} flux déjà abonnés sont absents de ce fichier :</p>`;
+html+=j.a_supprimer.map(x=>`<label style="display:block"><input type="checkbox" class="opmlsupchk" value="${x.id}" checked> ${esc(x.titre)} <span class="furl">${esc(x.url)}</span></label>`).join('');
+html+=`<div class="bar" style="margin-top:8px">
+<button onclick="appliquerOpml('ajout')">➕ Ajouter seulement les nouveaux</button>
+<button class="danger" onclick="appliquerOpml('sync')">🔄 Synchroniser (ajout + suppression cochée)</button>
+<button onclick="annulerOpml()">Annuler</button></div>`;
+}else{
+html+=`<div class="bar" style="margin-top:8px">
+<button onclick="appliquerOpml('ajout')">➕ Ajouter les nouveaux flux</button>
+<button onclick="annulerOpml()">Annuler</button></div>`;
+}
+box.innerHTML=html;box.style.display='block';}
+
+function annulerOpml(){document.getElementById('opmlpreview').style.display='none';xmlEnAttente='';}
+
+async function appliquerOpml(mode){
+let supprimerIds=[];let purge=false;
+if(mode==='sync'){
+supprimerIds=[...document.querySelectorAll('.opmlsupchk:checked')].map(c=>+c.value);
+if(supprimerIds.length){
+purge=confirm('Effacer AUSSI les articles archivés des flux supprimés ?\\nOK = effacer, Annuler = conserver');}}
+const r=await fetch('/api/opml/appliquer',{method:'POST',
+body:JSON.stringify({xml:xmlEnAttente,mode:mode,supprimer_ids:supprimerIds,purge:purge})});
+const j=await r.json();
+show(j.message);
+document.getElementById('opmlpreview').style.display='none';
+xmlEnAttente='';loadFeeds();load();}
+
 async function hook(){const r=await fetch('/api/webhook?'+qs(),{method:'POST'});
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 const j=await r.json();show(j.message);}
 
 async function loadFeeds(){const r=await fetch('/api/feeds');const f=await r.json();
 document.getElementById('feedlist').innerHTML=f.length?f.map(x=>
-`<div class="feedrow"><div class="finfo"><b>${esc(x.titre)}</b>
+`<div class="feedrow"><input type="checkbox" class="fdelchk" value="${x.id}">
+<div class="finfo"><b>${esc(x.titre)}</b>${x.alerte?' <span class="badge" title="'+x.echecs+' échecs consécutifs">⚠️</span>':''}
 ${x.categorie?' · '+esc(x.categorie):''} · ${x.articles} art.
-<div class="furl">${esc(x.url)}</div></div>
-<<<<<<< HEAD
-=======
+<div class="furl">${esc(x.url)}</div>
+<div class="editbox" id="editbox${x.id}" style="display:none;margin-top:6px">
+<input type="text" id="etitre${x.id}" value="${esc(x.titre)}" placeholder="Titre">
+<input type="text" id="ecat${x.id}" value="${esc(x.categorie||'')}" placeholder="Catégorie">
+<button onclick="saveEditFeed(${x.id})">💾</button>
+<button onclick="toggleEdit(${x.id})">Annuler</button>
+</div></div>
+<button onclick="toggleEdit(${x.id})">✏️</button>
 <button onclick="purgeFlux(${x.id},'${esc(x.titre).replace(/'/g,"\\\\'")}')">🧹 Vider</button>
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 <button onclick="delFeed(${x.id},'${esc(x.titre).replace(/'/g,"\\\\'")}')">🗑 Supprimer</button></div>`).join('')
 :'<p>Aucun flux. Ajoutez-en un ci-dessous ou importez un OPML.</p>';}
+
+function toggleEdit(id){const b=document.getElementById('editbox'+id);
+b.style.display=b.style.display==='none'?'block':'none';}
+
+async function saveEditFeed(id){
+const titre=document.getElementById('etitre'+id).value;
+const cat=document.getElementById('ecat'+id).value;
+const r=await fetch('/api/feeds/edit',{method:'POST',
+body:JSON.stringify({id:id,titre:titre,categorie:cat})});
+const j=await r.json();show(j.message);loadFeeds();}
+
+async function delFeedsBulk(){
+const ids=[...document.querySelectorAll('.fdelchk:checked')].map(c=>+c.value);
+if(!ids.length){show('Aucun flux sélectionné.');return;}
+if(!confirm('Supprimer les '+ids.length+' flux sélectionnés ?'))return;
+const wipe=confirm('Effacer AUSSI leurs articles archivés ?\\nOK = effacer, Annuler = conserver');
+const r=await fetch('/api/feeds/delete-bulk',{method:'POST',
+body:JSON.stringify({ids:ids,purge:wipe})});const j=await r.json();
+show(j.message);loadFeeds();load();}
 
 async function addFeed(){
 const body=JSON.stringify({url:document.getElementById('furl').value,
@@ -851,42 +815,30 @@ show(j.message);if(j.ok){document.getElementById('furl').value='';
 document.getElementById('ftitre').value='';document.getElementById('fcat').value='';loadFeeds();}}
 
 async function delFeed(id,titre){
-<<<<<<< HEAD
-const purge=confirm('Supprimer le flux « '+titre+' » ?\\n\\nOK = supprimer le flux en CONSERVANT ses articles archivés (recommandé).\\nPour effacer aussi les articles, maintenez la case suivante.')
-if(purge===null)return;
-let wipe=false;
-if(purge){wipe=confirm('Effacer AUSSI tous les articles archivés de ce flux ?\\n\\nOK = tout effacer\\nAnnuler = conserver les articles');} 
-else return;
-=======
 if(!confirm('Supprimer le flux « '+titre+' » ?'))return;
 const wipe=confirm('Effacer AUSSI ses articles archivés ?\\nOK = effacer, Annuler = conserver');
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
 const r=await fetch('/api/feeds/delete',{method:'POST',
 body:JSON.stringify({id:id,purge:wipe})});const j=await r.json();
 show(j.message);loadFeeds();load();}
 
-<<<<<<< HEAD
-async function loadPrompts(){const r=await fetch('/api/prompts');const j=await r.json();
-document.getElementById('ptri').value=j.tri;
-document.getElementById('psynth').value=j.synthese;}
-
-async function savePrompts(){
-const r=await fetch('/api/prompts',{method:'POST',
-body:JSON.stringify({tri:document.getElementById('ptri').value,
-synthese:document.getElementById('psynth').value})});
-const j=await r.json();show(j.message);}
-
-async function resetPrompts(){
-const r=await fetch('/api/prompts/reset',{method:'POST'});const j=await r.json();
-show(j.message);loadPrompts();}
-
-load();
-=======
 async function purgeFlux(id,titre){
 if(!confirm('Vider tous les articles de « '+titre+' » ?\\n(Le flux reste abonné.)'))return;
 const r=await fetch('/api/purge/flux',{method:'POST',
 body:JSON.stringify({id:id})});const j=await r.json();
 show(j.message);loadFeeds();load();}
+
+async function loadFiltreFlux(){const r=await fetch('/api/feeds');const f=await r.json();
+document.getElementById('filtrefluxlist').innerHTML=f.map(x=>
+`<label><input type="checkbox" class="fltchk" value="${x.id}" ${fluxFiltre.has(x.id)?'checked':''} onchange="toggleFiltreFlux(${x.id},this.checked)"> ${esc(x.titre)}${x.categorie?' · '+esc(x.categorie):''}</label>`).join('');}
+
+function toggleFiltreFlux(id,checked){
+if(checked)fluxFiltre.add(id);else fluxFiltre.delete(id);
+load();}
+
+function filtreFluxTout(sel){
+document.querySelectorAll('.fltchk').forEach(cb=>{cb.checked=sel;
+if(sel)fluxFiltre.add(+cb.value);else fluxFiltre.delete(+cb.value);});
+load();}
 
 async function purgePeriode(){const[s,e]=bornes();
 if(!confirm('Effacer tous les articles de la période '+s+' → '+e+' ?'))return;
@@ -901,13 +853,22 @@ show(j.message);load();}
 
 async function loadReglages(){const r=await fetch('/api/reglages');const j=await r.json();
 document.getElementById('pana').value=j.prompt;
-document.getElementById('rmail').value=j.mail;mailDefaut=j.mail;}
+document.getElementById('rmail').value=j.mail;mailDefaut=j.mail;
+document.getElementById('rmots').value=j.motscles;
+motsCles=(j.motscles||'').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);}
 
 async function saveMail(){
 const r=await fetch('/api/reglages/mail',{method:'POST',
 body:JSON.stringify({mail:document.getElementById('rmail').value})});
 const j=await r.json();mailDefaut=document.getElementById('rmail').value;
 show(j.message);load();}
+
+async function saveMots(){
+const r=await fetch('/api/reglages/motscles',{method:'POST',
+body:JSON.stringify({motscles:document.getElementById('rmots').value})});
+const j=await r.json();
+motsCles=document.getElementById('rmots').value.split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+show(j.message);render();}
 
 async function savePrompt(){
 const r=await fetch('/api/reglages/prompt',{method:'POST',
@@ -920,8 +881,9 @@ body:JSON.stringify({prompt:''})});const j=await r.json();
 show('Prompt par défaut rétabli.');loadReglages();}
 
 (async()=>{const r=await fetch('/api/reglages');const j=await r.json();
-mailDefaut=j.mail;load();})();
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
+mailDefaut=j.mail;
+motsCles=(j.motscles||'').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+load();})();
 </script></body></html>"""
 
 # ==================== SERVEUR HTTP ====================
@@ -937,59 +899,39 @@ class H(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(b)
     def _json(self, obj):
         self._send(json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
-<<<<<<< HEAD
-
-    def do_GET(self):
-        u = urlparse(self.path); q = parse_qs(u.query)
-        day = q.get("day", [None])[0]
-        if u.path == "/": self._send(PAGE)
-        elif u.path == "/api/articles":
-            self._json(articles_of_day(day))
-        elif u.path == "/api/feeds":
-            self._json(list_feeds())
-        elif u.path == "/api/prompts":
-            self._json({"tri": get_reglage("prompt_tri", PROMPT_TRI_DEFAUT),
-                        "synthese": get_reglage("prompt_synthese", PROMPT_SYNTHESE_DEFAUT)})
-        elif u.path == "/api/synthese":
-            d = day or datetime.now().strftime("%Y-%m-%d")
-            self._json({"texte": synthese_existante(d)})
-        elif u.path == "/export/json":
-            self._send(json.dumps(articles_of_day(day), ensure_ascii=False, indent=2),
-                       "application/json; charset=utf-8", f"articles_{day or 'jour'}.json")
-        elif u.path == "/export/csv":
-            buf = io.StringIO(); w = csv.writer(buf, delimiter=";")
-            w.writerow(["titre","lien","resume","date","flux","categorie"])
-            for a in articles_of_day(day):
-                w.writerow([a["titre"],a["lien"],a["resume"],a["date"],a["flux"],a["categorie"]])
-            self._send("\ufeff"+buf.getvalue(), "text/csv; charset=utf-8",
-                       f"articles_{day or 'jour'}.csv")
-=======
     def _params(self):
         u = urlparse(self.path); q = parse_qs(u.query)
-        return u, q.get("start", [None])[0], q.get("end", [None])[0]
+        start = q.get("start", [None])[0]
+        end = q.get("end", [None])[0]
+        feeds_param = q.get("feeds", [None])[0]
+        feed_ids = ([int(x) for x in feeds_param.split(",") if x.strip().isdigit()]
+                    if feeds_param else None)
+        return u, start, end, feed_ids
 
     def do_GET(self):
-        u, start, end = self._params()
+        u, start, end, feed_ids = self._params()
         if u.path == "/": self._send(PAGE)
         elif u.path == "/api/articles":
-            self._json(articles_periode(start, end))
+            self._json(articles_periode(start, end, feed_ids))
         elif u.path == "/api/feeds":
             self._json(list_feeds())
         elif u.path == "/api/reglages":
             self._json({"prompt": get_reglage("prompt_analyse", PROMPT_ANALYSE_DEFAUT),
-                        "mail": get_reglage("mail_defaut", "")})
+                        "mail": get_reglage("mail_defaut", ""),
+                        "motscles": get_reglage("mots_cles", "")})
         elif u.path == "/api/synthese":
             self._json({"texte": synthese_existante(start, end)})
         elif u.path == "/export/json":
             s, e = borne_periode(start, end)
-            self._send(json.dumps(articles_periode(s, e), ensure_ascii=False, indent=2),
+            self._send(json.dumps(articles_periode(s, e, feed_ids), ensure_ascii=False, indent=2),
                        "application/json; charset=utf-8", f"articles_{s}_{e}.json")
         elif u.path == "/export/csv":
             s, e = borne_periode(start, end)
             buf = io.StringIO(); w = csv.writer(buf, delimiter=";")
-            w.writerow(["titre","lien","resume","date","flux","categorie"])
-            for a in articles_periode(s, e):
-                w.writerow([a["titre"],a["lien"],a["resume"],a["date"],a["flux"],a["categorie"]])
+            w.writerow(["titre","lien","resume","date","flux","categorie","lu"])
+            for a in articles_periode(s, e, feed_ids):
+                w.writerow([a["titre"],a["lien"],a["resume"],a["date"],a["flux"],a["categorie"],
+                           "oui" if a["lu"] else "non"])
             self._send("\ufeff"+buf.getvalue(), "text/csv; charset=utf-8",
                        f"articles_{s}_{e}.csv")
         elif u.path == "/export/md":
@@ -1000,23 +942,12 @@ class H(BaseHTTPRequestHandler):
             else:
                 s, e = borne_periode(start, end)
                 self._send(md, "text/markdown; charset=utf-8", f"synthese_{s}_{e}.md")
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
         elif u.path == "/export/opml":
             self._send(export_opml(), "text/xml; charset=utf-8", "flux.opml")
         else: self.send_error(404)
 
     def do_POST(self):
-<<<<<<< HEAD
-        u = urlparse(self.path); q = parse_qs(u.query)
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
-        if u.path == "/api/refresh":
-            n, rep = refresh_all()
-            self._json({"nouveaux": n, "rapport": rep})
-        elif u.path == "/api/analyse":
-            ok, msg = analyser_jour(q.get("day", [None])[0])
-=======
-        u, start, end = self._params()
+        u, start, end, feed_ids = self._params()
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
         def jbody():
@@ -1027,47 +958,41 @@ class H(BaseHTTPRequestHandler):
             self._json({"nouveaux": n, "erreurs": err, "rapport": rep})
         elif u.path == "/api/analyse":
             ok, msg = analyser_periode(start, end)
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
             self._json({"ok": ok, "message": msg if not ok else "OK"})
-        elif u.path == "/api/import":
-            try: n = import_opml(body)
-            except Exception as e:
-                self._json({"ajoutes": 0, "erreur": str(e)}); return
-            self._json({"ajoutes": n})
         elif u.path == "/api/feeds/add":
-<<<<<<< HEAD
-            try: d = json.loads(body)
-            except Exception:
-                self._json({"ok": False, "message": "Requête invalide."}); return
-            ok, msg = add_feed(d.get("url",""), d.get("titre",""), d.get("categorie",""))
-            self._json({"ok": ok, "message": msg})
-        elif u.path == "/api/feeds/delete":
-            try: d = json.loads(body)
-            except Exception:
-                self._json({"ok": False, "message": "Requête invalide."}); return
-            ok, msg = delete_feed(int(d.get("id", 0)), bool(d.get("purge", False)))
-            self._json({"ok": ok, "message": msg})
-        elif u.path == "/api/prompts":
-            try: d = json.loads(body)
-            except Exception:
-                self._json({"ok": False, "message": "Requête invalide."}); return
-            set_reglage("prompt_tri", d.get("tri", ""))
-            set_reglage("prompt_synthese", d.get("synthese", ""))
-            self._json({"ok": True, "message": "Prompts enregistrés."})
-        elif u.path == "/api/prompts/reset":
-            set_reglage("prompt_tri", "")
-            set_reglage("prompt_synthese", "")
-            self._json({"ok": True, "message": "Prompts par défaut rétablis."})
-        elif u.path == "/api/webhook":
-            ok, msg = send_webhook(q.get("day", [None])[0])
-=======
             d = jbody()
             ok, msg = add_feed(d.get("url",""), d.get("titre",""), d.get("categorie",""))
+            self._json({"ok": ok, "message": msg})
+        elif u.path == "/api/feeds/edit":
+            d = jbody()
+            ok, msg = edit_feed(int(d.get("id", 0)), d.get("titre",""), d.get("categorie",""))
             self._json({"ok": ok, "message": msg})
         elif u.path == "/api/feeds/delete":
             d = jbody()
             ok, msg = delete_feed(int(d.get("id", 0)), bool(d.get("purge", False)))
             self._json({"ok": ok, "message": msg})
+        elif u.path == "/api/feeds/delete-bulk":
+            d = jbody()
+            ok, msg = delete_feeds_bulk(d.get("ids", []), bool(d.get("purge", False)))
+            self._json({"ok": ok, "message": msg})
+        elif u.path == "/api/articles/lu":
+            d = jbody()
+            marquer_lu(int(d.get("id", 0)), bool(d.get("lu", False)))
+            self._json({"ok": True})
+        elif u.path == "/api/opml/preview":
+            try:
+                nouveaux, a_supprimer = opml_preview(body)
+            except Exception as e:
+                self._json({"nouveaux": [], "a_supprimer": [], "erreur": str(e)}); return
+            self._json({"nouveaux": nouveaux, "a_supprimer": a_supprimer})
+        elif u.path == "/api/opml/appliquer":
+            d = jbody()
+            try:
+                supp = d.get("supprimer_ids") if d.get("mode") == "sync" else None
+                n, msg_sup = opml_appliquer(d.get("xml",""), supp, bool(d.get("purge", False)))
+            except Exception as e:
+                self._json({"ok": False, "message": f"Erreur d'import : {e}"}); return
+            self._json({"ok": True, "message": f"{n} flux ajoutés{msg_sup}."})
         elif u.path == "/api/purge/flux":
             d = jbody()
             ok, msg = purge_flux(int(d.get("id", 0)))
@@ -1082,23 +1007,19 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/reglages/mail":
             set_reglage("mail_defaut", jbody().get("mail", "").strip())
             self._json({"ok": True, "message": "Destinataire par défaut enregistré."})
+        elif u.path == "/api/reglages/motscles":
+            set_reglage("mots_cles", jbody().get("motscles", "").strip())
+            self._json({"ok": True, "message": "Mots-clés enregistrés."})
         elif u.path == "/api/reglages/prompt":
             set_reglage("prompt_analyse", jbody().get("prompt", ""))
             self._json({"ok": True, "message": "Prompt enregistré."})
         elif u.path == "/api/webhook":
             ok, msg = send_webhook(start, end)
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)
             self._json({"ok": ok, "message": msg})
         else: self.send_error(404)
 
 if __name__ == "__main__":
     db().close()
-<<<<<<< HEAD
-    print(f"RSSLocal v2 démarré → http://localhost:{PORT}  (Ctrl+C pour arrêter)")
+    print(f"RSSLocal v4 démarré → http://localhost:{PORT}  (Ctrl+C pour arrêter)")
     threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
     HTTPServer(("127.0.0.1", PORT), H).serve_forever()
-=======
-    print(f"RSSLocal v3 démarré → http://localhost:{PORT}  (Ctrl+C pour arrêter)")
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
-    HTTPServer(("127.0.0.1", PORT), H).serve_forever()
->>>>>>> 900a377 (V3 avec Sélection de période et prompt unique d'analyse)

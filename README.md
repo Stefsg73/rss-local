@@ -1,148 +1,156 @@
-# 📰 RSSLocal
+# RSSLocal
 
-Lecteur et agrégateur de flux RSS **100 % local**, en un seul fichier Python,
-**sans installation, sans droits administrateur, sans aucune dépendance externe**.
+Lecteur/agrégateur de flux RSS **100 % local**, en un seul fichier Python
+(stdlib uniquement), **sans installation ni droits admin**, avec analyse
+éditoriale IA optionnelle.
 
-Conçu pour les environnements verrouillés (poste professionnel sans droits admin,
-impossibilité d'installer Docker, FreshRSS ou toute application classique).
+## En une phrase
 
-**V2 — Décembre 2024** : gestion des flux, tri/regroupement par média,
-partage d'articles (mail/WhatsApp), synthèse repliable, prompts d'analyse éditables.
+Un script unique (`rss_local.py`) qui collecte vos flux RSS/Atom, les stocke
+dans une base SQLite locale, et sert une interface web sur
+`http://localhost:8765` — sans Docker, sans serveur externe, sans droits
+administrateur.
 
-## ✨ Fonctionnalités
+## Fonctionnalités (v4)
 
-- Agrégation de flux **RSS 2.0 et Atom** (collecte parallèle, dédoublonnage automatique)
-- **Import / export OPML** (compatible Feedly, Inoreader, FreshRSS…)
-- Interface web locale dans votre navigateur (`http://localhost:8765`)
-- Navigation par **date**, tri (chronologique, par média), résumés d'articles
-- **Gestion des flux** : ajouter/supprimer dans l'interface, conserver ou purger les archives
+- **Collecte** : RSS 2.0 et Atom, 8 flux rafraîchis en parallèle
+- **Gestion des flux** : ajout unitaire, édition en place (titre, catégorie),
+  suppression unitaire ou par lots (cases à cocher), purge des articles
+  (conservation ou effacement au choix)
+- **Import/export OPML** : import avec aperçu avant action — ajout simple des
+  nouveaux flux, ou **synchronisation complète** avec écran de confirmation
+  listant les flux absents du fichier avant toute suppression
+- **Badge d'alerte** ⚠️ sur les flux en échec de rafraîchissement récurrent
+  (3 échecs consécutifs par défaut)
+- **Lecture** : tri (récents/anciens/par média), marquage lu/non-lu,
+  recherche plein texte (titre + résumé), filtre par flux, mots-clés à
+  surveiller (surlignage dans la liste)
 - **Partage d'articles** : mail, WhatsApp, copie du lien
-- **Export JSON et CSV** des articles d'une journée (CSV compatible Excel FR, séparateur `;`)
-- **Envoi vers un webhook n8n** (optionnel) pour automatisation
-- **Analyse IA en entonnoir** (optionnel) : tri thématique par Claude Haiku,
-  synthèse éditoriale par Claude Sonnet — **prompts personnalisables** selon votre ligne éditoriale
-- Stockage dans une base **SQLite** locale (un simple fichier `rss_local.db`)
-- **Synthèse repliable** : masquer/afficher d'un clic, mémorisation par jo
+- **Analyse éditoriale IA** (Claude Sonnet, prompt éditable dans
+  l'interface) : synthèse par période, repliable, exportable en `.md`,
+  envoyable par mail
+- **Exports** : JSON, CSV, OPML — filtrables par période et par flux
+- **Purges** : automatique par ancienneté (réglable), ou manuelle
+  (totale, par flux, par période)
+- **Webhook n8n** optionnel (variable `WEBHOOK_N8N`)
 
-## 🔒 Confidentialité
+## Prérequis
 
-- La collecte, le stockage et la lecture sont **entièrement locaux**.
-  Le serveur web n'écoute que sur `127.0.0.1` : rien n'est accessible depuis le réseau.
-- Seule exception, **si vous l'activez** : la fonction d'analyse IA envoie les titres
-  et résumés d'articles à l'API Anthropic. Sans clé API, aucune donnée ne sort.
+- Python 3.9+ (aucune dépendance externe : uniquement la bibliothèque
+  standard)
+- Aucun droit administrateur nécessaire
 
-## 🚀 Installation (5 minutes, sans droits admin)
+## Installation
 
-### Prérequis
-Aucun, si ce n'est un navigateur web et la possibilité de télécharger des fichiers.
+### macOS / Linux
 
-### Étape 1 — Python portable (si Python n'est pas déjà installé)
-
-1. Rendez-vous sur https://www.python.org/downloads/windows/
-2. Téléchargez le **« Windows embeddable package (64-bit) »**
-   (fichier `python-3.12.x-embed-amd64.zip`) — c'est une simple archive,
-   **pas un installateur** : aucun droit admin requis.
-3. Décompressez-la dans un sous-dossier `python/` de ce projet :
-
-```
-rss-local/
-├── python/
-│   ├── python.exe
-│   └── ...
-├── rss_local.py
-└── lancer.bat
+```bash
+cd rss-local
+./lancer.sh
 ```
 
-> **Linux / macOS** : Python est généralement préinstallé. Vérifiez avec
-> `python3 --version` dans un terminal, puis utilisez `lancer.sh`.
+### Windows 11 (poste verrouillé, sans droits admin)
 
-### Étape 2 — Lancement
+`lancer.bat` détecte automatiquement un Python installé ou un Python
+portable (dossier `python/` à côté du script) :
 
-- **Windows** : double-cliquez sur `lancer.bat`
-- **Linux/macOS** : `chmod +x lancer.sh && ./lancer.sh`
-
-Votre navigateur s'ouvre automatiquement sur http://localhost:8765.
-
-> Si Python est installé de façon classique sur votre machine (commande `python`
-> disponible), vous pouvez aussi lancer directement : `python rss_local.py`
-
-### Étape 3 — Premiers pas
-
-1. Cliquez sur **📁 Importer OPML** et sélectionnez votre fichier de flux
-   (export depuis Feedly, Inoreader, etc. — ou `exemple_flux.opml` pour tester)
-2. Cliquez sur **🔄 Rafraîchir les flux**
-3. Les articles du jour s'affichent. Utilisez le sélecteur de date pour l'historique.
-
-## ⚙️ Configuration
-
-Toutes les options sont regroupées **en tête du fichier `rss_local.py`** :
-
-| Variable | Rôle | Défaut |
-|---|---|---|
-| `PORT` | Port du serveur local | `8765` |
-| `DB_PATH` | Fichier de base de données | `rss_local.db` |
-| `WEBHOOK_N8N` | URL du webhook n8n (vide = désactivé) | `""` |
-| `API_KEY` | Clé API Anthropic (vide = analyse désactivée) | `""` |
-| `MODELE_TRI` | Modèle pour le tri par lots | Claude Haiku |
-| `MODELE_SYNTHESE` | Modèle pour la synthèse finale | Claude Sonnet |
-| `TAILLE_LOT` | Articles par lot envoyé au tri | `20` |
-
-## 🧠 Analyse IA (optionnel)
-
-1. Créez une clé sur https://console.anthropic.com (menu *API Keys*)
-2. Collez-la dans la variable `API_KEY` de `rss_local.py`
-3. Cliquez sur **🧠 Analyser la journée**
-
-L'architecture « en entonnoir » minimise les coûts : les articles partent par
-lots vers **Haiku** (modèle économique) pour un tri thématique ; seuls les tris
-condensés remontent vers **Sonnet** pour la synthèse éditoriale (faits marquants,
-panorama par thème, angles d'articles). La synthèse s'affiche dans l'interface,
-est conservée en base et sauvegardée dans un fichier `synthese_AAAA-MM-JJ.txt`.
-
-⚠️ L'analyse IA est **payante** (facturation à l'usage par Anthropic) et nécessite
-une connexion internet. Consultez les tarifs en vigueur sur le site d'Anthropic.
-Ordre de grandeur : quelques centimes par analyse quotidienne de ~1 000 articles.
-
-## 📤 Exports
-
-| Bouton | Format | Contenu |
-|---|---|---|
-| ⬇ JSON | `.json` | Articles du jour sélectionné (structure complète) |
-| ⬇ CSV | `.csv` | Idem, séparateur `;`, encodage UTF-8 BOM (Excel FR) |
-| ⬇ OPML | `.opml` | La liste de tous vos flux, réimportable partout |
-| 📤 n8n | webhook | POST JSON des articles du jour vers `WEBHOOK_N8N` |
-
-## 🗃️ Données
-
-Tout est stocké dans `rss_local.db` (SQLite) à côté du script :
-- `feeds` : vos flux (URL, titre, catégorie)
-- `articles` : les articles collectés (dédupliqués par identifiant unique)
-- `syntheses` : les analyses IA générées
-
-**Sauvegarde** : copiez simplement ce fichier. **Réinitialisation** : supprimez-le.
-
-## 🛠️ Dépannage
-
-| Symptôme | Cause probable | Solution |
-|---|---|---|
-| La page ne s'ouvre pas | Port 8765 occupé | Changez `PORT` dans le script |
-| `⚠ Erreur réseau` sur un flux | Site bloquant les robots, proxy d'entreprise | Vérifiez l'URL dans un navigateur ; certains sites exigent des en-têtes spécifiques |
-| `⚠ XML invalide` | Le flux n'est pas du RSS/Atom valide | Testez l'URL sur validator.w3.org/feed |
-| Import OPML : 0 flux ajouté | Flux déjà présents ou OPML sans attribut `xmlUrl` | Ouvrez l'OPML dans un éditeur pour vérifier |
-| Analyse : « Aucune clé API » | `API_KEY` vide | Renseignez la clé en tête de script |
-| Le poste passe par un proxy d'entreprise | Requêtes sortantes bloquées | Définissez les variables d'environnement `HTTP_PROXY`/`HTTPS_PROXY` avant lancement |
-
-## 📁 Structure du projet
-
-```
-rss_local.py       Script unique : collecte, base, serveur web, interface, analyse IA
-lancer.bat         Lanceur Windows (utilise python/ portable ou le python système)
-lancer.sh          Lanceur Linux/macOS
-exemple_flux.opml  Fichier OPML de démonstration
-rss_local.db       (créé au premier lancement) base SQLite — non versionné
-synthese_*.txt     (créés par l'analyse IA) — non versionnés
+```bat
+lancer.bat
 ```
 
-## 📜 Licence
+Si votre poste est derrière un **proxy d'entreprise**, définissez au besoin
+`HTTP_PROXY` / `HTTPS_PROXY` dans `lancer.bat` avant de lancer le script.
 
-MIT — voir le fichier `LICENSE`
+### Dans les deux cas
+
+```bash
+python3 rss_local.py
+```
+
+L'interface s'ouvre automatiquement dans votre navigateur à l'adresse
+`http://localhost:8765`.
+
+## Configuration de la clé API (analyse IA)
+
+L'analyse éditoriale est **optionnelle** : sans clé API, tout le reste du
+lecteur (collecte, lecture, exports) fonctionne normalement.
+
+### Option 1 — Variable d'environnement (recommandée)
+
+**Windows 11** (sans droits admin) :
+1. `Windows` → « variables d'environnement » → **Modifier les variables
+   d'environnement pour ce compte**
+2. Variables utilisateur → **Nouveau** → nom `ANTHROPIC_API_KEY`, valeur
+   `sk-ant-...`
+3. Redémarrer le terminal avant de relancer le script
+
+Ou en une commande PowerShell :
+```powershell
+setx ANTHROPIC_API_KEY "sk-ant-votre-cle"
+```
+
+**macOS/Linux** :
+```bash
+export ANTHROPIC_API_KEY="sk-ant-votre-cle"
+```
+
+### Option 2 — En dur dans le script (déconseillé si le dépôt est public)
+
+Ligne 34 de `rss_local.py` :
+```python
+API_KEY = "sk-ant-votre-cle"
+```
+⚠️ Ne jamais committer une clé en dur. Vérifiez que `rss_local.py` reste
+hors du dépôt si vous utilisez cette option, ou que le dépôt est privé.
+
+### Crédits API
+
+Un compte sans crédits renvoie une erreur HTTP 400 (« credit balance too
+low »). Achat de crédits sur
+[console.anthropic.com](https://console.anthropic.com) → Plans & Billing.
+Budget indicatif pour un usage quotidien : 5-10 $/mois.
+
+## Fichiers du dépôt
+
+| Fichier | Rôle |
+|---|---|
+| `rss_local.py` | Script principal (collecte, base, serveur, interface) |
+| `lancer.bat` | Lancement Windows (détection Python système/portable) |
+| `lancer.sh` | Lancement macOS/Linux |
+| `exemple_flux.opml` | Exemple de fichier d'import |
+| `.gitignore` | Exclut `rss_local.db`, `synthese_*.txt`, `python/` |
+| `LICENSE` | MIT |
+
+## ⚠️ Migration depuis une version antérieure à la v4
+
+La v4 ajoute des colonnes aux tables `feeds` et `articles`. **Supprimez (ou
+renommez) votre `rss_local.db` existant** avant le premier lancement de
+cette version : il sera recréé automatiquement avec le nouveau schéma. Vos
+flux devront être réimportés (OPML) ou réajoutés.
+
+## Historique des versions
+
+### v4
+Suppression de flux par lots, édition en place d'un flux, synchronisation
+OPML avec aperçu et confirmation, marquage lu/non-lu, recherche plein
+texte, filtre d'affichage/export par flux, mots-clés à surveiller
+(surlignage), badge d'alerte sur les flux en échec récurrent.
+
+### v3
+Sélection de période (jour/7j/30j/personnalisée), analyse IA simplifiée
+(modèle et prompt uniques), destinataire mail par défaut, envoi de la
+synthèse par mail, export `.md`, purge automatique par ancienneté, purges
+manuelles (totale/flux/période), correctif SSL macOS intégré.
+
+### v2
+Gestion des flux dans l'interface, tri/regroupement par média, partage
+d'articles (mail/WhatsApp/copie), synthèse repliable/masquable, prompts
+d'analyse éditables, clé API par variable d'environnement.
+
+### v1
+Import OPML, rafraîchissement manuel, lecture par date, exports
+JSON/CSV/OPML, webhook n8n, analyse IA basique.
+
+## Licence
+
+MIT — voir `LICENSE`.
