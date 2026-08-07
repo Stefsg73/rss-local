@@ -1,37 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-RSSLocal v4 — Lecteur/agrégateur RSS 100 % local + analyse IA simplifiée.
+RSSLocal v5 (Phase 1) — Lecteur/agrégateur RSS 100 % local avec analyse IA.
 Aucun droit admin, aucune dépendance externe (stdlib Python uniquement).
 Usage : python3 rss_local.py   puis ouvrir http://localhost:8765
 
-Nouveautés v4 :
-- Suppression de flux par lots (cases à cocher + bouton, avec la même
-  double confirmation purge/conservation que la suppression unitaire)
-- Import OPML avec aperçu avant action : choix entre ajout seul ou
-  synchronisation complète (flux absents du fichier proposés à la
-  suppression, avec écran de confirmation détaillé)
-- Marquage lu / non-lu des articles (filtre dédié)
-- Recherche plein texte (titre + résumé) sur la période affichée
-- Filtre d'affichage et d'export par flux spécifiques (au lieu de tout/rien)
-- Mots-clés à surveiller : surlignage des articles correspondants
-- Édition en place d'un flux existant (titre, catégorie)
-- Badge d'alerte ⚠️ sur les flux en échec de rafraîchissement récurrent
+Nouveautés v5 — Phase 1 (refonte de l'interface) :
+- Interface en 3 colonnes : flux organisés en dossiers (gauche) / liste
+  condensée des articles (centre) / panneau de lecture (droite)
+- Dossiers de flux pliables/dépliables, avec glisser-déposer pour organiser
+  les flux (entre dossiers, ou pour réordonner) — remplace l'ancien champ
+  « catégorie » texte
+- Panneau de lecture avec tentative d'extraction du texte intégral de
+  l'article (heuristique, sans dépendance externe) ; repli automatique sur
+  le résumé RSS si l'extraction échoue (paywall, site en JavaScript, etc.),
+  avec mise en cache et bouton de rechargement manuel
+
+Phase 2 (prévue ensuite) : sélection multiple d'articles avec export
+groupé, raccourcis clavier, favicons des médias, générateur de flux
+Google News.
 
 ⚠️ IMPORTANT — changement de schéma de base de données :
-Cette version ajoute des colonnes aux tables `feeds` et `articles`.
-Supprimez (ou renommez) votre ancien rss_local.db avant le premier lancement
-de cette V4 : il sera recréé automatiquement avec le nouveau schéma.
+Cette version restructure les tables `feeds` et `articles` (dossiers,
+cache de texte intégral). Supprimez (ou renommez) votre ancien
+rss_local.db avant le premier lancement de cette V5 : il sera recréé
+automatiquement avec le nouveau schéma. Vos flux devront être réimportés
+(OPML) ou réajoutés.
 
-Nouveautés v3 (rappel) :
-- Sélection de période : aujourd'hui / 7 jours / 30 jours / personnalisée
-- Analyse simplifiée : un seul modèle (Sonnet), un seul prompt éditable
-- Destinataire mail par défaut (réglage dans l'interface)
-- Envoi de la synthèse par mail, export de la synthèse en .md
-- Statut de rafraîchissement sur une ligne (détail dépliable)
-- Purge automatique par ancienneté (CONSERVER_JOURS, articles + synthèses)
-- Purges manuelles : totale, par média, par période
+Rappel des nouveautés v4 : suppression de flux par lots, import OPML avec
+aperçu et choix ajout/synchronisation, marquage lu/non-lu, recherche plein
+texte, filtre d'affichage/export par flux, mots-clés à surveiller, édition
+en place d'un flux, badge d'alerte sur échec de rafraîchissement récurrent.
 """
-import sqlite3, json, csv, io, re, threading, webbrowser, ssl, os
+import sqlite3, json, csv, io, re, html, threading, webbrowser, ssl, os
 import urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -44,10 +44,12 @@ from concurrent.futures import ThreadPoolExecutor
 PORT = 8765
 DB_PATH = "rss_local.db"
 WEBHOOK_N8N = ""     # ex: "http://localhost:5678/webhook/rss" — vide si inutilisé
-USER_AGENT = "Mozilla/5.0 (RSSLocal/4.0; lecteur personnel)"
+USER_AGENT = "Mozilla/5.0 (RSSLocal/5.0; lecteur personnel)"
 TIMEOUT = 15
 CONSERVER_JOURS = 14  # purge auto : articles et synthèses plus vieux supprimés
 SEUIL_ECHECS_ALERTE = 3  # nombre d'échecs consécutifs avant badge ⚠️ sur un flux
+LONGUEUR_MIN_TEXTE_INTEGRAL = 250  # en-dessous, on considère l'extraction ratée
+LONGUEUR_MAX_TEXTE_INTEGRAL = 15000  # troncature de sécurité
 
 # --- Analyse IA (laisser API_KEY vide pour désactiver) ---
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # ou collez la clé ici : "sk-ant-..."
@@ -95,13 +97,15 @@ PROMPT_ANALYSE_DEFAUT = (
 
 def db():
     c = sqlite3.connect(DB_PATH)
+    c.execute("""CREATE TABLE IF NOT EXISTS dossiers(
+        id INTEGER PRIMARY KEY, nom TEXT UNIQUE, ordre INTEGER DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS feeds(
-        id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, category TEXT DEFAULT '',
-        echecs INTEGER DEFAULT 0)""")
+        id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT,
+        dossier_id INTEGER, ordre INTEGER DEFAULT 0, echecs INTEGER DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS articles(
         id INTEGER PRIMARY KEY, feed_id INTEGER, guid TEXT UNIQUE,
         title TEXT, link TEXT, summary TEXT, published TEXT, fetched TEXT,
-        lu INTEGER DEFAULT 0)""")
+        lu INTEGER DEFAULT 0, texte_integral TEXT, texte_recupere_le TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS syntheses(
         id INTEGER PRIMARY KEY, jour TEXT UNIQUE, texte TEXT, cree TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS reglages(
@@ -169,7 +173,9 @@ def parse_date(s):
     except Exception: return None
 
 def strip_html(t):
-    return re.sub(r"<[^>]+>", " ", t or "").strip()[:600]
+    t = re.sub(r"<[^>]+>", " ", t or "")
+    t = html.unescape(t)
+    return re.sub(r"\s+", " ", t).strip()[:600]
 
 def fetch_feed(feed_id, url):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -235,37 +241,105 @@ def refresh_all():
     c.commit(); c.close()
     return new_count, erreurs, report
 
+# ==================== DOSSIERS ====================
+
+def list_dossiers():
+    c = db()
+    rows = c.execute("SELECT id, nom, ordre FROM dossiers ORDER BY ordre, nom").fetchall()
+    c.close()
+    return [{"id": r[0], "nom": r[1], "ordre": r[2]} for r in rows]
+
+def get_or_create_dossier(nom, c=None):
+    """Renvoie l'id du dossier portant ce nom, en le créant si besoin.
+    Accepte une connexion existante pour éviter tout verrou SQLite lors
+    d'un import OPML (plusieurs écritures dans la même transaction)."""
+    nom = (nom or "").strip()
+    if not nom:
+        return None
+    ferme = c is None
+    if c is None:
+        c = db()
+    row = c.execute("SELECT id FROM dossiers WHERE nom=?", (nom,)).fetchone()
+    if row:
+        did = row[0]
+    else:
+        maxo = c.execute("SELECT COALESCE(MAX(ordre),-1) FROM dossiers").fetchone()[0]
+        c.execute("INSERT INTO dossiers(nom, ordre) VALUES(?,?)", (nom, maxo + 1))
+        did = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    if ferme:
+        c.commit(); c.close()
+    return did
+
+def ajouter_dossier(nom):
+    did = get_or_create_dossier(nom)
+    return (True, "Dossier prêt.", did) if did else (False, "Nom de dossier requis.", None)
+
+def renommer_dossier(dossier_id, nom):
+    nom = (nom or "").strip()
+    if not nom:
+        return False, "Nom de dossier requis."
+    c = db()
+    row = c.execute("SELECT id FROM dossiers WHERE id=?", (dossier_id,)).fetchone()
+    if not row:
+        c.close(); return False, "Dossier introuvable."
+    try:
+        c.execute("UPDATE dossiers SET nom=? WHERE id=?", (nom, dossier_id))
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.close(); return False, "Un dossier porte déjà ce nom."
+    c.close()
+    return True, "Dossier renommé."
+
+def supprimer_dossier(dossier_id):
+    c = db()
+    row = c.execute("SELECT nom FROM dossiers WHERE id=?", (dossier_id,)).fetchone()
+    if not row:
+        c.close(); return False, "Dossier introuvable."
+    c.execute("UPDATE feeds SET dossier_id=NULL WHERE dossier_id=?", (dossier_id,))
+    c.execute("DELETE FROM dossiers WHERE id=?", (dossier_id,))
+    c.commit(); c.close()
+    return True, f"Dossier « {row[0]} » supprimé (ses flux sont déplacés hors dossier, pas supprimés)."
+
+def reordonner_dossiers(ids):
+    c = db()
+    for i, did in enumerate(ids or []):
+        c.execute("UPDATE dossiers SET ordre=? WHERE id=?", (i, int(did)))
+    c.commit(); c.close()
+    return True
+
 # ==================== GESTION DES FLUX ====================
 
 def list_feeds():
     c = db()
-    rows = c.execute("""SELECT f.id, f.title, f.url, f.category, f.echecs,
+    rows = c.execute("""SELECT f.id, f.title, f.url, f.dossier_id, f.ordre, f.echecs,
                         COUNT(a.id) FROM feeds f
                         LEFT JOIN articles a ON a.feed_id = f.id
-                        GROUP BY f.id ORDER BY f.category, f.title""").fetchall()
+                        GROUP BY f.id ORDER BY f.dossier_id, f.ordre, f.title""").fetchall()
     c.close()
-    return [{"id": r[0], "titre": r[1], "url": r[2], "categorie": r[3],
-             "echecs": r[4], "alerte": r[4] >= SEUIL_ECHECS_ALERTE,
-             "articles": r[5]} for r in rows]
+    return [{"id": r[0], "titre": r[1], "url": r[2], "dossier_id": r[3], "ordre": r[4],
+             "echecs": r[5], "alerte": r[5] >= SEUIL_ECHECS_ALERTE,
+             "articles": r[6]} for r in rows]
 
-def add_feed(url, title="", category=""):
+def add_feed(url, title="", dossier_id=None):
     if not url or not url.startswith(("http://", "https://")):
         return False, "URL invalide (elle doit commencer par http:// ou https://)."
     c = db()
-    c.execute("INSERT OR IGNORE INTO feeds(url, title, category) VALUES(?,?,?)",
-              (url.strip(), (title or url).strip(), category.strip()))
+    maxo = c.execute("SELECT COALESCE(MAX(ordre),-1) FROM feeds WHERE dossier_id IS ?",
+                     (dossier_id,)).fetchone()[0]
+    c.execute("INSERT OR IGNORE INTO feeds(url, title, dossier_id, ordre) VALUES(?,?,?,?)",
+              (url.strip(), (title or url).strip(), dossier_id, maxo + 1))
     n = c.execute("SELECT changes()").fetchone()[0]
     c.commit(); c.close()
     return (True, "Flux ajouté.") if n else (False, "Ce flux existe déjà.")
 
-def edit_feed(feed_id, titre, categorie):
+def edit_feed(feed_id, titre, dossier_id):
     c = db()
     row = c.execute("SELECT title FROM feeds WHERE id=?", (feed_id,)).fetchone()
     if not row:
         c.close(); return False, "Flux introuvable."
     nouveau_titre = (titre or "").strip() or row[0]
-    c.execute("UPDATE feeds SET title=?, category=? WHERE id=?",
-              (nouveau_titre, (categorie or "").strip(), feed_id))
+    c.execute("UPDATE feeds SET title=?, dossier_id=? WHERE id=?",
+              (nouveau_titre, dossier_id, feed_id))
     c.commit(); c.close()
     return True, f"Flux « {nouveau_titre} » mis à jour."
 
@@ -298,6 +372,16 @@ def delete_feeds_bulk(ids, purge=False):
     return True, (f"{len(rows)} flux supprimés ({noms})"
                   + (" — articles effacés." if purge else " — articles conservés."))
 
+def reordonner_feeds(dossier_id, ids):
+    """Réordonne (et réaffecte au besoin) les flux d'un dossier — ou de la
+    racine si dossier_id est None — d'après la liste ordonnée reçue du
+    glisser-déposer côté interface."""
+    c = db()
+    for i, fid in enumerate(ids or []):
+        c.execute("UPDATE feeds SET dossier_id=?, ordre=? WHERE id=?", (dossier_id, i, int(fid)))
+    c.commit(); c.close()
+    return True
+
 # ==================== OPML ====================
 
 def normalize_url(u):
@@ -308,16 +392,18 @@ def normalize_url(u):
     return u.rstrip("/")
 
 def opml_outlines(xml_text):
-    """Retourne une liste de (url, titre, catégorie) à partir d'un texte OPML."""
+    """Retourne une liste de (url, titre, nom_dossier) à partir d'un OPML.
+    nom_dossier correspond au groupement (<outline> sans xmlUrl) le plus
+    proche du flux, vide si le flux est à la racine du fichier."""
     root = ET.fromstring(xml_text)
     out = []
-    def walk(node, cat=""):
+    def walk(node, dossier=""):
         for o in node.findall("outline"):
             url = o.get("xmlUrl")
             if url:
-                out.append((url, o.get("title") or o.get("text") or url, cat))
+                out.append((url, o.get("title") or o.get("text") or url, dossier))
             else:
-                walk(o, o.get("title") or o.get("text") or cat)
+                walk(o, o.get("title") or o.get("text") or dossier)
     body = root.find("body")
     if body is not None: walk(body)
     return out
@@ -325,9 +411,17 @@ def opml_outlines(xml_text):
 def import_opml(xml_text):
     outlines = opml_outlines(xml_text)
     c = db(); n = 0
-    for url, titre, cat in outlines:
-        c.execute("INSERT OR IGNORE INTO feeds(url,title,category) VALUES(?,?,?)",
-                  (url, titre, cat))
+    cache_dossiers = {}
+    for url, titre, nom_dossier in outlines:
+        did = None
+        if nom_dossier:
+            if nom_dossier not in cache_dossiers:
+                cache_dossiers[nom_dossier] = get_or_create_dossier(nom_dossier, c)
+            did = cache_dossiers[nom_dossier]
+        maxo = c.execute("SELECT COALESCE(MAX(ordre),-1) FROM feeds WHERE dossier_id IS ?",
+                         (did,)).fetchone()[0]
+        c.execute("INSERT OR IGNORE INTO feeds(url,title,dossier_id,ordre) VALUES(?,?,?,?)",
+                  (url, titre, did, maxo + 1))
         n += c.execute("SELECT changes()").fetchone()[0]
     c.commit(); c.close()
     return n
@@ -337,20 +431,22 @@ def opml_preview(xml_text):
     renvoie les nouveaux flux à ajouter et les flux existants absents
     du fichier (candidats à la suppression en mode synchronisation)."""
     outlines = opml_outlines(xml_text)
-    urls_fichier = {normalize_url(u) for u, t, cat in outlines}
+    urls_fichier = {normalize_url(u) for u, t, d in outlines}
     c = db()
-    existants = c.execute("SELECT id, title, url, category FROM feeds").fetchall()
+    existants = c.execute("""SELECT f.id, f.title, f.url, COALESCE(d.nom,'')
+                             FROM feeds f LEFT JOIN dossiers d ON d.id=f.dossier_id""").fetchall()
     c.close()
     urls_existantes = {normalize_url(u) for _, _, u, _ in existants}
-    nouveaux = [{"url": u, "titre": t, "categorie": cat} for u, t, cat in outlines
+    nouveaux = [{"url": u, "titre": t, "dossier": d} for u, t, d in outlines
                 if normalize_url(u) not in urls_existantes]
-    a_supprimer = [{"id": r[0], "titre": r[1], "url": r[2], "categorie": r[3]}
+    a_supprimer = [{"id": r[0], "titre": r[1], "url": r[2], "dossier": r[3]}
                    for r in existants if normalize_url(r[2]) not in urls_fichier]
     return nouveaux, a_supprimer
 
 def opml_appliquer(xml_text, supprimer_ids=None, purge=False):
-    """Applique un import OPML : ajoute toujours les nouveaux flux, et
-    supprime en plus les flux listés dans supprimer_ids (mode synchronisation)."""
+    """Applique un import OPML : ajoute toujours les nouveaux flux (en
+    recréant les dossiers nommés dans le fichier si besoin), et supprime en
+    plus les flux listés dans supprimer_ids (mode synchronisation)."""
     n = import_opml(xml_text)
     msg_sup = ""
     if supprimer_ids:
@@ -360,15 +456,109 @@ def opml_appliquer(xml_text, supprimer_ids=None, purge=False):
 
 def export_opml():
     c = db()
-    feeds = c.execute("SELECT title, url, category FROM feeds ORDER BY category, title").fetchall()
+    rows = c.execute("""SELECT f.title, f.url, COALESCE(d.nom,'') FROM feeds f
+                        LEFT JOIN dossiers d ON d.id=f.dossier_id
+                        ORDER BY d.ordre, f.ordre, f.title""").fetchall()
     c.close()
     lines = ['<?xml version="1.0" encoding="UTF-8"?>',
              '<opml version="2.0"><head><title>RSSLocal export</title></head><body>']
-    for t, u, cat in feeds:
-        t = (t or "").replace('"', "'"); cat = (cat or "").replace('"', "'")
-        lines.append(f'<outline text="{t}" title="{t}" type="rss" xmlUrl="{u}" category="{cat}"/>')
+    for t, u, dossier in rows:
+        t = (t or "").replace('"', "'"); dossier = (dossier or "").replace('"', "'")
+        lines.append(f'<outline text="{t}" title="{t}" type="rss" xmlUrl="{u}" category="{dossier}"/>')
     lines.append("</body></opml>")
     return "\n".join(lines)
+
+# ==================== TEXTE INTÉGRAL (extraction heuristique) ====================
+
+def _retirer_balises(page, tags):
+    for t in tags:
+        page = re.sub(rf"<{t}\b[^>]*>.*?</{t}>", " ", page, flags=re.I | re.S)
+    return page
+
+def _blocs(page, tag):
+    return re.findall(rf"<{tag}\b[^>]*>.*?</{tag}>", page, flags=re.I | re.S)
+
+def _texte_brut(bloc):
+    t = re.sub(r"<[^>]+>", " ", bloc)
+    t = html.unescape(t)
+    return re.sub(r"\s+", " ", t).strip()
+
+def _texte_paragraphes(bloc):
+    """Reconstruit le texte en conservant les coupures de paragraphes
+    (un <p> par ligne), plus lisible qu'un bloc de texte compact."""
+    paragraphes = re.findall(r"<p\b[^>]*>(.*?)</p>", bloc, flags=re.I | re.S)
+    if not paragraphes:
+        return _texte_brut(bloc)
+    textes = []
+    for p in paragraphes:
+        t = html.unescape(re.sub(r"<[^>]+>", " ", p))
+        t = re.sub(r"\s+", " ", t).strip()
+        if t:
+            textes.append(t)
+    return "\n\n".join(textes)
+
+def extraire_texte_de_html(page):
+    """Heuristique d'extraction du corps d'un article à partir du HTML brut
+    d'une page. Renvoie None si rien d'exploitable n'a été trouvé (ce qui
+    déclenche le repli sur le résumé RSS côté appelant)."""
+    page = _retirer_balises(page, ["script", "style", "nav", "header", "footer",
+                                   "aside", "form", "iframe", "noscript", "svg"])
+    candidats = _blocs(page, "article")
+    bloc = max(candidats, key=lambda b: len(_texte_brut(b))) if candidats else None
+    if not bloc:
+        divs = _blocs(page, "div") + _blocs(page, "section")
+        notes = []
+        for b in divs:
+            nb_p = len(re.findall(r"<p\b", b, re.I))
+            if nb_p >= 2:
+                notes.append((len(_texte_brut(b)), b))
+        if notes:
+            notes.sort(key=lambda x: x[0], reverse=True)
+            bloc = notes[0][1]
+    if not bloc:
+        return None
+    texte = _texte_paragraphes(bloc)
+    if len(texte) < LONGUEUR_MIN_TEXTE_INTEGRAL:
+        return None
+    return texte[:LONGUEUR_MAX_TEXTE_INTEGRAL]
+
+def extraire_texte_integral(url):
+    if not url:
+        return None
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=SSL_CTX) as r:
+            data = r.read()
+            charset = r.headers.get_content_charset() or "utf-8"
+    except Exception:
+        return None
+    try:
+        page = data.decode(charset, errors="replace")
+    except Exception:
+        page = data.decode("utf-8", errors="replace")
+    return extraire_texte_de_html(page)
+
+def obtenir_texte_article(article_id, forcer=False):
+    c = db()
+    row = c.execute("""SELECT link, texte_integral, texte_recupere_le, summary
+                       FROM articles WHERE id=?""", (article_id,)).fetchone()
+    if not row:
+        c.close(); return {"ok": False, "message": "Article introuvable."}
+    link, cache, recupere_le, resume = row
+    if cache and not forcer:
+        c.close()
+        return {"ok": True, "texte": cache, "source": "integral", "recupere_le": recupere_le}
+    texte = extraire_texte_integral(link)
+    now = datetime.now(timezone.utc).isoformat()
+    if texte:
+        c.execute("UPDATE articles SET texte_integral=?, texte_recupere_le=? WHERE id=?",
+                  (texte, now, article_id))
+        c.commit(); c.close()
+        return {"ok": True, "texte": texte, "source": "integral", "recupere_le": now}
+    c.execute("UPDATE articles SET texte_recupere_le=? WHERE id=?", (now, article_id))
+    c.commit(); c.close()
+    return {"ok": True, "texte": resume, "source": "resume", "recupere_le": now,
+            "message": "Texte intégral non disponible sur ce média — affichage du résumé."}
 
 # ==================== ARTICLES : PÉRIODES / LECTURE / EXPORTS / WEBHOOK ====================
 
@@ -383,7 +573,7 @@ def borne_periode(start, end):
 def articles_periode(start=None, end=None, feed_ids=None):
     start, end = borne_periode(start, end)
     c = db()
-    q = """SELECT a.id, a.title, a.link, a.summary, a.published, f.title, f.category, a.lu
+    q = """SELECT a.id, a.title, a.link, a.summary, a.published, f.title, f.dossier_id, a.lu
            FROM articles a JOIN feeds f ON f.id=a.feed_id
            WHERE substr(a.published,1,10) >= ? AND substr(a.published,1,10) <= ?"""
     params = [start, end]
@@ -394,7 +584,7 @@ def articles_periode(start=None, end=None, feed_ids=None):
     rows = c.execute(q, params).fetchall()
     c.close()
     return [{"id": r[0], "titre": r[1], "lien": r[2], "resume": r[3], "date": r[4],
-             "flux": r[5], "categorie": r[6], "lu": bool(r[7])} for r in rows]
+             "flux": r[5], "dossier_id": r[6], "lu": bool(r[7])} for r in rows]
 
 def marquer_lu(article_id, lu):
     c = db()
@@ -489,51 +679,121 @@ def synthese_markdown(start, end):
 PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <title>RSSLocal</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{font-family:system-ui,sans-serif;max-width:960px;margin:0 auto;padding:16px;background:#f7f7f5;color:#222}
-h1{font-size:1.4rem} .bar{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;align-items:center}
-button,a.btn,label.btn{padding:8px 14px;border:1px solid #bbb;border-radius:8px;background:#fff;cursor:pointer;text-decoration:none;color:#222;font-size:.9rem}
+*{box-sizing:border-box}
+body{font-family:system-ui,sans-serif;margin:0;background:#f7f7f5;color:#222;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+.topbar{padding:10px 16px 0}
+h1{font-size:1.25rem;margin:6px 0}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;align-items:center}
+button,a.btn,label.btn{padding:7px 12px;border:1px solid #bbb;border-radius:8px;background:#fff;cursor:pointer;text-decoration:none;color:#222;font-size:.85rem}
 button:hover,a.btn:hover,label.btn:hover{background:#eee}
 button.ia{background:#4a3b8f;color:#fff;border-color:#4a3b8f}button.ia:hover{background:#5c4bb0}
 button.danger{border-color:#c0392b;color:#c0392b}button.danger:hover{background:#fdf0ee}
-select,input[type=date],input[type=text],input[type=email]{padding:6px;border-radius:8px;border:1px solid #bbb;font-size:.9rem}
-.art{background:#fff;border:1px solid #e2e2e0;border-radius:10px;padding:12px 16px;margin:10px 0}
-.art h3{margin:0 0 4px;font-size:1.02rem}.art .meta{color:#777;font-size:.8rem}
-.art p{margin:6px 0 0;font-size:.9rem;color:#444}
-.art.lu{opacity:.5}
-.art.surligne{border-left:4px solid #e6b800;background:#fffdf2}
-.share{margin-top:6px;display:flex;gap:6px}
-.share a,.share button{padding:3px 8px;font-size:.8rem;border:1px solid #ddd;border-radius:6px;background:#fafafa;cursor:pointer;text-decoration:none;color:#333}
-.luBtn{margin-left:8px;padding:2px 8px;font-size:.75rem;border:1px solid #ccc;border-radius:6px;background:#fafafa;cursor:pointer}
-#status{font-size:.85rem;color:#333;background:#eee;padding:8px 12px;border-radius:8px;display:none;margin:8px 0}
-#status details{margin-top:6px}#status summary{cursor:pointer;color:#666;font-size:.8rem}
-#status pre{white-space:pre-wrap;font-size:.78rem;color:#555;margin:6px 0 0}
-details.media{background:#fff;border:1px solid #e2e2e0;border-radius:10px;margin:8px 0;padding:4px 12px}
-details.media summary{cursor:pointer;font-weight:600;padding:8px 0}
-details.media .art{border:none;border-top:1px solid #eee;border-radius:0;margin:0}
-#synthbox{background:#fffbe8;border:1px solid #e6d98a;border-radius:10px;margin:12px 0;display:none}
-#synthhead{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;cursor:pointer;font-weight:600}
-#synthbody{white-space:pre-wrap;padding:0 16px 12px;font-size:.92rem}
-#synthactions{padding:0 16px 14px;display:flex;gap:8px}
-#synthactions a,#synthactions button{padding:4px 10px;font-size:.8rem;border:1px solid #d8c96a;border-radius:6px;background:#fff;cursor:pointer;text-decoration:none;color:#333}
-#synthclose{border:none;background:none;font-size:1.1rem;cursor:pointer;color:#8a7b2e}
-.panel{background:#fff;border:1px solid #ccc;border-radius:10px;padding:16px;margin:12px 0;display:none}
-.panel h2{font-size:1.05rem;margin:0 0 10px}
-.panel h3{font-size:.98rem;margin:10px 0 6px}
-.feedrow{display:flex;justify-content:space-between;align-items:flex-start;padding:6px 0;border-bottom:1px solid #eee;font-size:.9rem;gap:8px}
-.feedrow .finfo{flex:1;min-width:0}.feedrow .furl{color:#999;font-size:.75rem;word-break:break-all}
-.feedrow button{padding:4px 10px;font-size:.8rem;white-space:nowrap}
-.feedrow input[type=checkbox]{margin-top:4px}
-.editbox{display:flex;gap:6px;flex-wrap:wrap}
-.editbox input{flex:1;min-width:100px}
+select,input[type=date],input[type=text],input[type=email]{padding:5px;border-radius:8px;border:1px solid #bbb;font-size:.85rem}
+#status{font-size:.82rem;color:#333;background:#eee;padding:6px 12px;border-radius:8px;display:none;margin:6px 16px}
+#status details{margin-top:4px}#status summary{cursor:pointer;color:#666;font-size:.78rem}
+#status pre{white-space:pre-wrap;font-size:.76rem;color:#555;margin:4px 0 0}
+.panel{background:#fff;border:1px solid #ccc;border-radius:10px;padding:14px 16px;margin:6px 16px;display:none}
+.panel h2{font-size:1rem;margin:0 0 8px}
+.feedrow{display:flex;justify-content:space-between;align-items:flex-start;padding:5px 0;border-bottom:1px solid #eee;font-size:.85rem;gap:8px}
+.feedrow .finfo{flex:1;min-width:0}.feedrow .furl{color:#999;font-size:.72rem;word-break:break-all}
+.feedrow button{padding:3px 8px;font-size:.75rem;white-space:nowrap}
+.editbox{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}.editbox input,.editbox select{flex:1;min-width:100px}
 .badge{cursor:help}
-textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb;border-radius:8px;padding:8px;font-size:.85rem;font-family:inherit}
-.addrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.addrow input{flex:1;min-width:120px}
+textarea{width:100%;box-sizing:border-box;min-height:100px;border:1px solid #bbb;border-radius:8px;padding:8px;font-size:.82rem;font-family:inherit}
+.addrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.addrow input,.addrow select{flex:1;min-width:110px}
 #customdates{display:none;gap:6px;align-items:center}
-.reglrow{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
-#filtrefluxlist label{display:block;padding:2px 0;font-size:.9rem}
+.reglrow{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
+
+/* ─── 3 COLONNES ─── */
+#main{flex:1;display:flex;overflow:hidden;min-height:0}
+
+#sidebar{width:230px;min-width:190px;flex-shrink:0;background:#20242c;color:#e4e6eb;display:flex;flex-direction:column;overflow:hidden}
+#sidebar-scroll{flex:1;overflow-y:auto;padding:6px 0}
+#sidebar-scroll::-webkit-scrollbar{width:5px}
+#sidebar-scroll::-webkit-scrollbar-thumb{background:#4a4f59;border-radius:3px}
+#sidebar-bottom{padding:8px;border-top:1px solid #3a3f4a;display:flex;flex-direction:column;gap:6px}
+#sidebar-bottom button{background:#2c313c;color:#e4e6eb;border:1px solid #3a3f4a}
+#sidebar-bottom button:hover{background:#3a3f4a}
+.sb-item{display:block;width:calc(100% - 12px);margin:2px 6px;text-align:left;padding:7px 10px;border:none;border-radius:8px;background:none;color:#e4e6eb;font-size:.85rem;cursor:pointer;font-family:inherit}
+.sb-item:hover{background:#2c313c}
+.sb-item.active{background:#3a4a6b;color:#8ab4f8}
+.sb-dossier-head{display:flex;align-items:center;gap:6px;margin:2px 6px;padding:6px 8px;border-radius:8px;cursor:pointer;font-size:.85rem;font-weight:600}
+.sb-dossier-head:hover{background:#2c313c}
+.sb-dossier-head.active{background:#3a4a6b;color:#8ab4f8}
+.sb-dossier-head.drag-over{box-shadow:inset 0 0 0 2px #8ab4f8;background:#2c313c}
+.sb-toggle{width:12px;flex-shrink:0;text-align:center;color:#9aa0a6;font-size:.7rem}
+.sb-nom{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sb-actions{display:none;gap:2px;flex-shrink:0}
+.sb-dossier-head:hover .sb-actions{display:flex}
+.sb-actions button{background:none;border:none;color:#9aa0a6;cursor:pointer;font-size:.78rem;padding:1px 3px}
+.sb-actions button:hover{color:#8ab4f8}
+.sb-feeds{padding-left:16px}
+.sb-flux{display:flex;align-items:center;gap:6px;margin:1px 6px;padding:6px 8px;border-radius:8px;cursor:grab;font-size:.82rem;color:#c7cad1}
+.sb-flux:hover{background:#2c313c}
+.sb-flux.active{background:#3a4a6b;color:#8ab4f8}
+.sb-flux.dragging{opacity:.35}
+.sb-flux.drag-over{box-shadow:inset 0 0 0 2px #8ab4f8}
+.sb-fnom{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sb-vide{padding:4px 12px;font-size:.75rem;color:#666}
+.sb-sans{cursor:default}
+
+#col-articles{width:360px;min-width:260px;flex-shrink:0;background:#fff;border-right:1px solid #ddd;display:flex;flex-direction:column;overflow:hidden}
+#col-articles-tools{padding:8px 10px;border-bottom:1px solid #eee;display:flex;gap:6px;flex-wrap:wrap}
+#article-list{flex:1;overflow-y:auto}
+#article-list::-webkit-scrollbar{width:5px}
+#article-list::-webkit-scrollbar-thumb{background:#dadce0;border-radius:3px}
+.a-item{padding:10px 12px;border-bottom:1px solid #eee;cursor:pointer;border-left:3px solid transparent}
+.a-item:hover{background:#f8f9fa}
+.a-item.active{background:#e8f0fe;border-left-color:#1a73e8}
+.a-item.lu{opacity:.5}
+.a-item.surligne{background:#fffdf2;border-left-color:#e6b800}
+.a-top{display:flex;align-items:center;gap:6px;margin-bottom:1px}
+.a-check{flex-shrink:0;cursor:pointer}
+.a-feed{font-size:.68rem;color:#777;text-transform:uppercase;letter-spacing:.3px;font-weight:600}
+.a-title{font-size:.88rem;font-weight:600;margin:2px 0 3px;line-height:1.3}
+.a-accroche{font-size:.78rem;color:#666;line-height:1.3;margin-bottom:3px}
+.a-meta{font-size:.72rem;color:#999;display:flex;justify-content:space-between;align-items:center}
+.luBtn{padding:1px 7px;font-size:.7rem;border:1px solid #ccc;border-radius:6px;background:#fafafa;cursor:pointer}
+details.media{margin:4px 8px}details.media summary{cursor:pointer;font-weight:600;font-size:.82rem;padding:6px 4px;color:#555}
+.sb-favicon{width:14px;height:14px;flex-shrink:0;border-radius:2px;background:#3a3f4a}
+
+/* ─── BARRE D'EXPORT FLOTTANTE ─── */
+#export-bar{position:fixed;left:0;right:0;bottom:0;background:#1b2430;color:#fff;transform:translateY(100%);transition:transform .25s ease;z-index:200;box-shadow:0 -4px 16px rgba(0,0,0,.2)}
+#export-bar.open{transform:translateY(0)}
+#export-bar-inner{display:flex;align-items:center;gap:12px;padding:10px 16px}
+#export-count{font-size:.82rem;font-weight:600;white-space:nowrap}
+#export-num{background:#e37400;border-radius:10px;padding:1px 8px;margin-right:6px}
+#export-chips{flex:1;display:flex;gap:6px;overflow-x:auto;padding:2px 0}
+.export-chip{display:flex;align-items:center;gap:5px;background:#2d3a47;padding:4px 9px;border-radius:14px;font-size:.75rem;white-space:nowrap;flex-shrink:0}
+.export-chip button{background:none;border:none;color:#9aa0a6;cursor:pointer;font-size:.75rem;padding:0}
+.export-chip button:hover{color:#fff}
+#export-actions{display:flex;gap:8px;flex-shrink:0}
+#export-actions button{background:#2d3a47;color:#fff;border:1px solid #3d4a57}
+#export-actions button:hover{background:#3d4a57}
+
+#col-lecture{flex:1;overflow-y:auto;background:#fff;padding:24px 32px}
+#col-lecture::-webkit-scrollbar{width:6px}
+#col-lecture::-webkit-scrollbar-thumb{background:#dadce0;border-radius:3px}
+.lect-placeholder{color:#999;font-size:.9rem;padding:40px 0;text-align:center}
+.lect-head h2{font-size:1.3rem;margin:0 0 6px;line-height:1.3}
+.lect-meta{color:#888;font-size:.82rem;margin-bottom:12px}
+.lect-actions{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px}
+.lect-actions a,.lect-actions button{padding:5px 11px;font-size:.8rem;border:1px solid #ccc;border-radius:8px;background:#fafafa;cursor:pointer;text-decoration:none;color:#333}
+.lect-corps{font-size:.95rem;line-height:1.65;color:#2a2a2a;max-width:70ch}
+.lect-corps p{margin:0 0 14px}
+.lect-fallback{background:#fef7e0;border:1px solid #e6d98a;border-radius:8px;padding:8px 12px;font-size:.82rem;color:#7a6a1a;margin-bottom:14px}
+.lect-loading{color:#999;font-style:italic}
+
+#synthbox{background:#fffbe8;border:1px solid #e6d98a;border-radius:10px;margin:6px 16px;display:none}
+#synthhead{display:flex;justify-content:space-between;align-items:center;padding:8px 14px;cursor:pointer;font-weight:600;font-size:.9rem}
+#synthbody{white-space:pre-wrap;padding:0 14px 10px;font-size:.88rem}
+#synthactions{padding:0 14px 12px;display:flex;gap:8px}
+#synthactions a,#synthactions button{padding:4px 10px;font-size:.78rem;border:1px solid #d8c96a;border-radius:6px;background:#fff;cursor:pointer;text-decoration:none;color:#333}
+#synthclose{border:none;background:none;font-size:1.1rem;cursor:pointer;color:#8a7b2e}
 #opmlpreview{display:none}
 </style></head><body>
-<h1>📰 RSSLocal v4 — agrégateur local</h1>
+<div class="topbar">
+<h1>📰 RSSLocal v5</h1>
 <div class="bar">
 <button onclick="refresh()">🔄 Rafraîchir</button>
 <select id="periode" onchange="periodeChange()">
@@ -554,18 +814,18 @@ textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb
 <option value="nonlu">Non lus seulement</option>
 <option value="lu">Lus seulement</option>
 </select>
-<input type="text" id="recherche" placeholder="🔎 Rechercher…" oninput="render()" style="min-width:140px">
+<input type="text" id="recherche" placeholder="🔎 Rechercher…" oninput="render()" style="min-width:130px">
 <button class="ia" onclick="analyse()">🧠 Analyser la période</button>
 </div>
 <div class="bar">
 <button onclick="toggle('pfeeds');loadFeeds()">⚙️ Flux</button>
 <button onclick="toggle('preglages');loadReglages()">🛠 Réglages</button>
-<button onclick="toggle('pfiltreflux');loadFiltreFlux()">🔍 Filtrer par flux</button>
 <a class="btn" id="ejson" href="#">⬇ JSON</a>
 <a class="btn" id="ecsv" href="#">⬇ CSV</a>
 <a class="btn" href="/export/opml">⬇ OPML</a>
 <button onclick="hook()">📤 n8n</button>
 <label class="btn">📁 Importer OPML<input type="file" id="opml" style="display:none" onchange="upload(this)"></label>
+</div>
 </div>
 <div id="status"></div>
 <div class="panel" id="opmlpreview"></div>
@@ -579,19 +839,25 @@ textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb
 <div class="addrow">
 <input type="text" id="furl" placeholder="URL du flux (https://…)">
 <input type="text" id="ftitre" placeholder="Titre (optionnel)">
-<input type="text" id="fcat" placeholder="Catégorie (optionnel)">
+<select id="fdossier"></select>
 <button onclick="addFeed()">➕ Ajouter</button>
 </div>
+<h2 style="margin-top:16px">🗞️ Générer un flux Google News</h2>
+<div class="addrow">
+<input type="text" id="gnquery" placeholder="Mot-clé de recherche (ex: intelligence artificielle)">
+<select id="gnlang">
+<option value="fr|FR">Français (France)</option>
+<option value="fr|BE">Français (Belgique)</option>
+<option value="en-US|US">Anglais (États-Unis)</option>
+<option value="en-GB|GB">Anglais (Royaume-Uni)</option>
+<option value="es|ES">Espagnol (Espagne)</option>
+<option value="de|DE">Allemand (Allemagne)</option>
+</select>
+<select id="gndossier"></select>
+<button onclick="ajouterFluxGoogleNews()">➕ Créer ce flux</button>
 </div>
-
-<div class="panel" id="pfiltreflux">
-<h2>🔍 Filtrer l'affichage et les exports par flux</h2>
-<p style="font-size:.85rem;color:#666;margin-top:0">Aucune case cochée = tous les flux affichés et exportés.</p>
-<div class="bar">
-<button onclick="filtreFluxTout(true)">Tout cocher</button>
-<button onclick="filtreFluxTout(false)">Tout décocher</button>
-</div>
-<div id="filtrefluxlist"></div>
+<p style="font-size:.78rem;color:#888">Crée un flux RSS Google News basé sur une recherche par mot-clé —
+utile pour une veille ponctuelle sans devoir trouver le flux RSS natif d'un média.</p>
 </div>
 
 <div class="panel" id="preglages">
@@ -602,19 +868,19 @@ textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb
 <div class="reglrow"><label>🔎 Mots-clés à surveiller (séparés par des virgules) :</label>
 <input type="text" id="rmots" placeholder="ex: budget, grève, élection" style="flex:1;min-width:200px">
 <button onclick="saveMots()">💾</button></div>
-<p style="font-size:.8rem;color:#888;margin-top:-4px">Les articles correspondants sont surlignés dans la liste (aucune notification).</p>
-<p style="font-size:.85rem;color:#666;margin-bottom:4px">🧠 Prompt d'analyse (envoyé à Sonnet avec la liste des articles) :</p>
+<p style="font-size:.78rem;color:#888;margin-top:-4px">Les articles correspondants sont surlignés dans la liste (aucune notification).</p>
+<p style="font-size:.82rem;color:#666;margin-bottom:4px">🧠 Prompt d'analyse (envoyé à Sonnet avec la liste des articles) :</p>
 <textarea id="pana"></textarea>
 <div class="bar">
 <button onclick="savePrompt()">💾 Enregistrer le prompt</button>
 <button onclick="resetPrompt()">↩️ Prompt par défaut</button>
 </div>
-<h2 style="margin-top:18px">🗑 Purges</h2>
+<h2 style="margin-top:16px">🗑 Purges</h2>
 <div class="bar">
 <button class="danger" onclick="purgePeriode()">Effacer les articles de la période affichée</button>
 <button class="danger" onclick="purgeTotale()">Tout effacer (articles + synthèses)</button>
 </div>
-<p style="font-size:.8rem;color:#888">Purge automatique : les articles et synthèses de plus de
+<p style="font-size:.78rem;color:#888">Purge automatique : les articles et synthèses de plus de
 <b>CONSERVER_JOURS</b> jours (réglé dans le script) sont supprimés à chaque rafraîchissement.</p>
 </div>
 
@@ -627,11 +893,41 @@ textarea{width:100%;box-sizing:border-box;min-height:110px;border:1px solid #bbb
 <a id="smail" href="#">✉️ Envoyer par mail</a>
 </div>
 </div>
-<div id="list"></div>
+
+<div id="main">
+<div id="sidebar">
+<div id="sidebar-scroll"></div>
+<div id="sidebar-bottom">
+<button onclick="nouveauDossierUI()">➕ Nouveau dossier</button>
+</div>
+</div>
+<div id="col-articles">
+<div id="col-articles-tools"><span style="font-size:.76rem;color:#888">Raccourcis : <b>J</b>/<b>K</b> naviguer · <b>E</b> sélectionner · <b>O</b> ouvrir l'original</span></div>
+<div id="article-list"></div>
+</div>
+<div id="col-lecture"><div class="lect-placeholder">Sélectionnez un article dans la liste pour l'afficher ici.</div></div>
+</div>
+
+<div id="export-bar">
+<div id="export-bar-inner">
+<div id="export-count"><span id="export-num">0</span>article(s) sélectionné(s)</div>
+<div id="export-chips"></div>
+<div id="export-actions">
+<button onclick="exporterSelectionMd()">⬇ Export .md</button>
+<button onclick="viderSelection()">Vider</button>
+</div>
+</div>
+</div>
 
 <script>
 let synthHidden={};let mailDefaut='';let motsCles=[];let articlesCache=[];
-let fluxFiltre=new Set();let xmlEnAttente='';
+let feedsCache=[];let dossiersCache=[];let dossiersReplies={};let vue={type:'tous'};
+let articleSelectionne=null;let xmlEnAttente='';
+let selectionExport=new Map();let ordreAffiche=[];
+
+function favicon(url){try{const h=new URL(url).hostname;
+return `https://www.google.com/s2/favicons?domain=${h}&sz=32`;}catch{return'';}}
+
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
 function fmt(d){return d.toISOString().slice(0,10);}
 function bornes(){
@@ -645,8 +941,16 @@ function periodeChange(){
 document.getElementById('customdates').style.display=
 document.getElementById('periode').value==='perso'?'inline-flex':'none';
 if(document.getElementById('periode').value!=='perso')load();}
+
+function feedsDe(dossierId){return feedsCache.filter(f=>f.dossier_id===dossierId).map(f=>f.id);}
+function feedIdsPourVue(){
+if(vue.type==='flux')return[vue.id];
+if(vue.type==='dossier')return feedsDe(vue.id);
+return null;}
+
 function qs(){const[s,e]=bornes();let q='start='+s+'&end='+e;
-if(fluxFiltre.size)q+='&feeds='+[...fluxFiltre].join(',');
+const fids=feedIdsPourVue();
+if(fids&&fids.length)q+='&feeds='+fids.join(',');
 return q;}
 function links(){document.getElementById('ejson').href='/export/json?'+qs();
 document.getElementById('ecsv').href='/export/csv?'+qs();
@@ -656,20 +960,113 @@ p.style.display=p.style.display==='block'?'none':'block';}
 function show(t,detail){const s=document.getElementById('status');s.style.display='block';
 s.innerHTML=esc(t)+(detail?'<details><summary>voir le détail</summary><pre>'+esc(detail)+'</pre></details>':'');}
 
-function artHTML(x){
-const txt=encodeURIComponent(x.titre+' — '+x.lien);
-const mail='mailto:'+encodeURIComponent(mailDefaut)+'?subject='+encodeURIComponent(x.titre)+'&body='+txt;
-const wa='https://wa.me/?text='+txt;
+/* ─── BARRE LATÉRALE : DOSSIERS & FLUX ─── */
+
+async function chargerBarreLaterale(){
+const[rf,rd]=await Promise.all([fetch('/api/feeds'),fetch('/api/dossiers')]);
+feedsCache=await rf.json();dossiersCache=await rd.json();
+renderSidebar();}
+
+function ligneFlux(f){
+return `<div class="sb-flux ${vue.type==='flux'&&vue.id===f.id?'active':''}" draggable="true"
+onclick="definirVue({type:'flux',id:${f.id}})"
+ondragstart="event.dataTransfer.setData('text/plain','${f.id}');this.classList.add('dragging')"
+ondragend="this.classList.remove('dragging')"
+ondragover="event.preventDefault();event.stopPropagation();this.classList.add('drag-over')"
+ondragleave="this.classList.remove('drag-over')"
+ondrop="deposerSurFlux(event,${f.id})">
+<img class="sb-favicon" src="${favicon(f.url)}" onerror="this.style.display='none'" alt="">
+<span class="sb-fnom">${esc(f.titre)}</span>${f.alerte?' <span class="badge" title="'+f.echecs+' échecs consécutifs">⚠️</span>':''}
+</div>`;}
+
+function renderSidebar(){
+const sansDossier=feedsCache.filter(f=>f.dossier_id===null);
+let html=`<button class="sb-item ${vue.type==='tous'?'active':''}" onclick="definirVue({type:'tous'})">📋 Tous les flux</button>`;
+html+=dossiersCache.map(d=>{
+const feeds=feedsCache.filter(f=>f.dossier_id===d.id);
+const ouvert=!dossiersReplies[d.id];
+const nomEsc=esc(d.nom).replace(/'/g,"\\\\'");
+return `<div class="sb-dossier">
+<div class="sb-dossier-head ${vue.type==='dossier'&&vue.id===d.id?'active':''}"
+onclick="definirVue({type:'dossier',id:${d.id}})"
+ondragover="event.preventDefault();this.classList.add('drag-over')"
+ondragleave="this.classList.remove('drag-over')"
+ondrop="deposerSurDossier(event,${d.id})">
+<span class="sb-toggle" onclick="event.stopPropagation();basculerDossier(${d.id})">${ouvert?'▼':'▶'}</span>
+<span class="sb-nom">${esc(d.nom)}</span>
+<span class="sb-actions">
+<button onclick="event.stopPropagation();renommerDossierUI(${d.id},'${nomEsc}')" title="Renommer">✏️</button>
+<button onclick="event.stopPropagation();supprimerDossierUI(${d.id},'${nomEsc}')" title="Supprimer">🗑</button>
+</span></div>
+${ouvert?`<div class="sb-feeds">${feeds.map(ligneFlux).join('')||'<div class="sb-vide">Aucun flux</div>'}</div>`:''}
+</div>`;}).join('');
+const ouvertSans=!dossiersReplies['sans'];
+html+=`<div class="sb-dossier">
+<div class="sb-dossier-head sb-sans"
+ondragover="event.preventDefault();this.classList.add('drag-over')"
+ondragleave="this.classList.remove('drag-over')"
+ondrop="deposerSurDossier(event,null)">
+<span class="sb-toggle" onclick="basculerDossier('sans')">${ouvertSans?'▼':'▶'}</span>
+<span class="sb-nom">📂 Sans dossier</span></div>
+${ouvertSans?`<div class="sb-feeds">${sansDossier.map(ligneFlux).join('')||'<div class="sb-vide">Aucun flux</div>'}</div>`:''}
+</div>`;
+document.getElementById('sidebar-scroll').innerHTML=html;}
+
+function basculerDossier(id){dossiersReplies[id]=!dossiersReplies[id];renderSidebar();}
+function definirVue(v){vue=v;renderSidebar();load();}
+
+async function deposerSurDossier(e,dossierId){
+e.preventDefault();e.currentTarget.classList.remove('drag-over');
+const fid=+e.dataTransfer.getData('text/plain');
+let ids=feedsDe(dossierId).filter(id=>id!==fid);ids.push(fid);
+await fetch('/api/feeds/reorder',{method:'POST',body:JSON.stringify({dossier_id:dossierId,ids:ids})});
+chargerBarreLaterale();}
+
+async function deposerSurFlux(e,cibleId){
+e.preventDefault();e.stopPropagation();e.currentTarget.classList.remove('drag-over');
+const fid=+e.dataTransfer.getData('text/plain');
+if(fid===cibleId)return;
+const cible=feedsCache.find(f=>f.id===cibleId);
+const dossierId=cible?cible.dossier_id:null;
+let ids=feedsDe(dossierId).filter(id=>id!==fid);
+const idx=ids.indexOf(cibleId);
+ids.splice(idx,0,fid);
+await fetch('/api/feeds/reorder',{method:'POST',body:JSON.stringify({dossier_id:dossierId,ids:ids})});
+chargerBarreLaterale();}
+
+async function nouveauDossierUI(){
+const nom=prompt('Nom du nouveau dossier :');
+if(!nom)return;
+await fetch('/api/dossiers/add',{method:'POST',body:JSON.stringify({nom:nom})});
+chargerBarreLaterale();}
+
+async function renommerDossierUI(id,nomActuel){
+const nom=prompt('Renommer le dossier :',nomActuel);
+if(!nom||nom===nomActuel)return;
+const r=await fetch('/api/dossiers/rename',{method:'POST',body:JSON.stringify({id:id,nom:nom})});
+const j=await r.json();if(!j.ok)show(j.message);
+chargerBarreLaterale();}
+
+async function supprimerDossierUI(id,nom){
+if(!confirm('Supprimer le dossier « '+nom+' » ?\\n(Les flux qu\\'il contient seront déplacés hors dossier, pas supprimés.)'))return;
+await fetch('/api/dossiers/delete',{method:'POST',body:JSON.stringify({id:id})});
+if(vue.type==='dossier'&&vue.id===id)definirVue({type:'tous'});else chargerBarreLaterale();}
+
+/* ─── LISTE CENTRALE DES ARTICLES ─── */
+
+function artCondense(x){
 const cible=(x.titre+' '+x.resume).toLowerCase();
 const surligne=motsCles.length&&motsCles.some(k=>cible.includes(k));
-return `<div class="art ${x.lu?'lu':''} ${surligne?'surligne':''}">
-<h3><a href="${esc(x.lien)}" target="_blank">${esc(x.titre)}</a></h3>
-<div class="meta">${esc(x.flux)} — ${x.date?x.date.slice(0,16).replace('T',' '):''}
-<button class="luBtn" onclick="toggleLu(${x.id},${!x.lu})">${x.lu?'✓ Lu':'○ Non lu'}</button></div>
-<p>${esc(x.resume)}</p>
-<div class="share"><a href="${mail}">✉️ Mail</a>
-<a href="${wa}" target="_blank">💬 WhatsApp</a>
-<button onclick="navigator.clipboard.writeText('${esc(x.lien)}');this.textContent='✓ Copié'">📋 Copier</button></div></div>`;}
+const accroche=(x.resume||'').slice(0,140)+((x.resume||'').length>140?'…':'');
+return `<div class="a-item ${x.lu?'lu':''} ${surligne?'surligne':''} ${articleSelectionne===x.id?'active':''}"
+onclick="ouvrirArticle(${x.id})">
+<div class="a-top"><input type="checkbox" class="a-check" onclick="toggleSelection(event,${x.id})"
+${selectionExport.has(x.id)?'checked':''}><span class="a-feed">${esc(x.flux)}</span></div>
+<div class="a-title">${esc(x.titre)}</div>
+<div class="a-accroche">${esc(accroche)}</div>
+<div class="a-meta"><span>${x.date?x.date.slice(0,16).replace('T',' '):''}</span>
+<button class="luBtn" onclick="event.stopPropagation();toggleLu(${x.id},${!x.lu})">${x.lu?'✓ Lu':'○ Non lu'}</button></div>
+</div>`;}
 
 function render(){
 let a=articlesCache.slice();
@@ -679,15 +1076,68 @@ const luF=document.getElementById('lufiltre').value;
 if(q)a=a.filter(x=>(x.titre+' '+x.resume).toLowerCase().includes(q));
 if(luF==='nonlu')a=a.filter(x=>!x.lu);
 if(luF==='lu')a=a.filter(x=>x.lu);
-const list=document.getElementById('list');
-if(!a.length){list.innerHTML='<p>Aucun article ne correspond à ces critères.</p>';return;}
+if(mode==='asc')a=a.slice().reverse();
+ordreAffiche=a.map(x=>x.id);
+const list=document.getElementById('article-list');
+if(!a.length){list.innerHTML='<p style="padding:16px;color:#888;font-size:.85rem">Aucun article ne correspond à ces critères.</p>';return;}
 if(mode==='media'){
 const g={};a.forEach(x=>{(g[x.flux]=g[x.flux]||[]).push(x);});
 list.innerHTML=Object.keys(g).sort().map(m=>
 `<details class="media" open><summary>${esc(m)} (${g[m].length})</summary>
-${g[m].map(artHTML).join('')}</details>`).join('');}
-else{if(mode==='asc')a=a.slice().reverse();
-list.innerHTML=a.map(artHTML).join('');}}
+${g[m].map(artCondense).join('')}</details>`).join('');}
+else{list.innerHTML=a.map(artCondense).join('');}}
+
+/* ─── SÉLECTION MULTIPLE & EXPORT GROUPÉ ─── */
+
+function toggleSelection(e,id){e.stopPropagation();
+if(selectionExport.has(id)){selectionExport.delete(id);}
+else{const a=articlesCache.find(x=>x.id===id);if(a)selectionExport.set(id,a);}
+renderExportBar();render();}
+
+function retirerSelection(id){selectionExport.delete(id);renderExportBar();render();}
+function viderSelection(){selectionExport.clear();renderExportBar();render();}
+
+function renderExportBar(){
+const bar=document.getElementById('export-bar');
+const n=selectionExport.size;
+document.getElementById('export-num').textContent=n+' ';
+document.getElementById('export-chips').innerHTML=[...selectionExport.values()].map(a=>{
+const t=a.titre.length>30?a.titre.slice(0,30)+'…':a.titre;
+return `<span class="export-chip">${esc(t)}<button onclick="retirerSelection(${a.id})">✕</button></span>`;
+}).join('');
+bar.classList.toggle('open',n>0);}
+
+function exporterSelectionMd(){
+const arts=[...selectionExport.values()];
+if(!arts.length)return;
+const maintenant=new Date().toLocaleString('fr-FR');
+let md=`# Sélection RSSLocal — ${maintenant}\n\n> ${arts.length} article${arts.length>1?'s':''} sélectionné${arts.length>1?'s':''}\n\n`;
+arts.forEach(a=>{md+=`## ${a.titre}\n\n*${a.flux} — ${(a.date||'').slice(0,16).replace('T',' ')}*\n\n`
++`${a.resume||''}\n\n[Lire l'article](${a.lien})\n\n---\n\n`;});
+const blob=new Blob([md],{type:'text/markdown;charset=utf-8'});
+const url=URL.createObjectURL(blob);
+const lien=document.createElement('a');lien.href=url;lien.download='selection_'+fmt(new Date())+'.md';
+document.body.appendChild(lien);lien.click();lien.remove();
+URL.revokeObjectURL(url);
+show('✓ '+arts.length+' article(s) exporté(s) en Markdown.');}
+
+/* ─── RACCOURCIS CLAVIER ─── */
+
+function naviguerArticle(direction){
+if(!ordreAffiche.length)return;
+let idx=ordreAffiche.indexOf(articleSelectionne);
+idx=idx===-1?(direction>0?0:ordreAffiche.length-1):idx+direction;
+if(idx<0)idx=0;if(idx>=ordreAffiche.length)idx=ordreAffiche.length-1;
+ouvrirArticle(ordreAffiche[idx]);}
+
+document.addEventListener('keydown',e=>{
+const tag=(document.activeElement||{}).tagName;
+if(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT')return;
+if(e.key==='j'||e.key==='J'){naviguerArticle(1);}
+else if(e.key==='k'||e.key==='K'){naviguerArticle(-1);}
+else if(e.key==='e'||e.key==='E'){if(articleSelectionne)toggleSelection({stopPropagation(){}},articleSelectionne);}
+else if(e.key==='o'||e.key==='O'){const a=articlesCache.find(x=>x.id===articleSelectionne);if(a)window.open(a.lien,'_blank');}
+});
 
 async function toggleLu(id,lu){
 await fetch('/api/articles/lu',{method:'POST',body:JSON.stringify({id:id,lu:lu})});
@@ -714,11 +1164,56 @@ b.style.display=b.style.display==='none'?'block':'none';}
 function closeSynth(){const[s,e]=bornes();synthHidden[s+'_'+e]=true;
 document.getElementById('synthbox').style.display='none';}
 
+/* ─── PANNEAU DE LECTURE ─── */
+
+async function ouvrirArticle(id){
+articleSelectionne=id;render();
+const a=articlesCache.find(x=>x.id===id);
+if(!a)return;
+const pane=document.getElementById('col-lecture');
+pane.innerHTML=`<div class="lect-head"><h2>${esc(a.titre)}</h2>
+<div class="lect-meta">${esc(a.flux)} — ${a.date?a.date.slice(0,16).replace('T',' '):''}</div>
+<div class="lect-actions">
+<a href="${esc(a.lien)}" target="_blank">🔗 Ouvrir l'original</a>
+<button onclick="toggleLuLecture(${a.id})">${a.lu?'✓ Lu':'○ Non lu'}</button>
+<button onclick="rechargerTexte(${a.id})">🔄 Recharger le texte intégral</button>
+<a href="mailto:${encodeURIComponent(mailDefaut)}?subject=${encodeURIComponent(a.titre)}&body=${encodeURIComponent(a.titre+' — '+a.lien)}">✉️ Mail</a>
+<a href="https://wa.me/?text=${encodeURIComponent(a.titre+' — '+a.lien)}" target="_blank">💬 WhatsApp</a>
+<button onclick="navigator.clipboard.writeText('${esc(a.lien)}');this.textContent='✓ Copié'">📋 Copier le lien</button>
+</div></div>
+<div class="lect-corps" id="lect-corps"><p class="lect-loading">Récupération du texte intégral…</p></div>`;
+const r=await fetch('/api/article/texte?id='+id);
+const j=await r.json();
+if(articleSelectionne!==id)return;
+afficherTexte(j);}
+
+function afficherTexte(j){
+const corps=document.getElementById('lect-corps');
+if(!j.ok){corps.innerHTML='<p>Erreur de récupération du texte.</p>';return;}
+let out='';
+if(j.source==='resume')out+='<p class="lect-fallback">'+esc(j.message)+'</p>';
+const paras=(j.texte||'').split('\\n\\n').filter(Boolean);
+out+=paras.length?paras.map(p=>'<p>'+esc(p)+'</p>').join(''):'<p>'+esc(j.texte||'')+'</p>';
+corps.innerHTML=out;}
+
+async function rechargerTexte(id){
+const corps=document.getElementById('lect-corps');
+corps.innerHTML='<p class="lect-loading">Nouvelle tentative de récupération…</p>';
+const r=await fetch('/api/article/texte/recharger',{method:'POST',body:JSON.stringify({id:id})});
+const j=await r.json();afficherTexte(j);}
+
+async function toggleLuLecture(id){
+const a=articlesCache.find(x=>x.id===id);if(!a)return;
+await toggleLu(id,!a.lu);
+ouvrirArticle(id);}
+
+/* ─── RAFRAÎCHISSEMENT / ANALYSE ─── */
+
 async function refresh(){show('Rafraîchissement en cours…');
 const r=await fetch('/api/refresh',{method:'POST'});const j=await r.json();
 const ligne=(j.erreurs?'⚠ ':'✓ ')+j.nouveaux+' nouveaux articles'
 +(j.erreurs?' — '+j.erreurs+' flux en erreur':'');
-show(ligne,j.rapport.join('\\n'));load();}
+show(ligne,j.rapport.join('\\n'));load();chargerBarreLaterale();}
 
 async function analyse(){
 show('🧠 Analyse en cours (Sonnet)… jusqu\\'à 2 minutes selon le volume.');
@@ -726,6 +1221,8 @@ const r=await fetch('/api/analyse?'+qs(),{method:'POST'});const j=await r.json()
 if(j.ok){const[s,e]=bornes();synthHidden[s+'_'+e]=false;
 show('✓ Synthèse générée.');load();}
 else{show('⚠ '+j.message);}}
+
+/* ─── OPML ─── */
 
 async function upload(inp){
 xmlEnAttente=await inp.files[0].text();
@@ -740,7 +1237,7 @@ html+=`<p>${j.nouveaux.length} nouveau(x) flux seront ajoutés`
 +(j.nouveaux.length?' : '+j.nouveaux.map(x=>esc(x.titre)).join(', '):'')+`.</p>`;
 if(j.a_supprimer&&j.a_supprimer.length){
 html+=`<p>${j.a_supprimer.length} flux déjà abonnés sont absents de ce fichier :</p>`;
-html+=j.a_supprimer.map(x=>`<label style="display:block"><input type="checkbox" class="opmlsupchk" value="${x.id}" checked> ${esc(x.titre)} <span class="furl">${esc(x.url)}</span></label>`).join('');
+html+=j.a_supprimer.map(x=>`<label style="display:block"><input type="checkbox" class="opmlsupchk" value="${x.id}" checked> ${esc(x.titre)} <span style="color:#999;font-size:.75rem">${esc(x.url)}</span></label>`).join('');
 html+=`<div class="bar" style="margin-top:8px">
 <button onclick="appliquerOpml('ajout')">➕ Ajouter seulement les nouveaux</button>
 <button class="danger" onclick="appliquerOpml('sync')">🔄 Synchroniser (ajout + suppression cochée)</button>
@@ -765,37 +1262,66 @@ body:JSON.stringify({xml:xmlEnAttente,mode:mode,supprimer_ids:supprimerIds,purge
 const j=await r.json();
 show(j.message);
 document.getElementById('opmlpreview').style.display='none';
-xmlEnAttente='';loadFeeds();load();}
+xmlEnAttente='';refreshFeeds();}
 
 async function hook(){const r=await fetch('/api/webhook?'+qs(),{method:'POST'});
 const j=await r.json();show(j.message);}
 
-async function loadFeeds(){const r=await fetch('/api/feeds');const f=await r.json();
+/* ─── PANNEAU « GÉRER LES FLUX » ─── */
+
+function optionsDossiers(selectionne){
+return '<option value="">— Sans dossier —</option>'+dossiersCache.map(d=>
+`<option value="${d.id}" ${selectionne===d.id?'selected':''}>${esc(d.nom)}</option>`).join('');}
+
+async function loadFeeds(){
+const[rf,rd]=await Promise.all([fetch('/api/feeds'),fetch('/api/dossiers')]);
+const f=await rf.json();dossiersCache=await rd.json();
 document.getElementById('feedlist').innerHTML=f.length?f.map(x=>
 `<div class="feedrow"><input type="checkbox" class="fdelchk" value="${x.id}">
 <div class="finfo"><b>${esc(x.titre)}</b>${x.alerte?' <span class="badge" title="'+x.echecs+' échecs consécutifs">⚠️</span>':''}
-${x.categorie?' · '+esc(x.categorie):''} · ${x.articles} art.
+· ${x.articles} art.
 <div class="furl">${esc(x.url)}</div>
-<div class="editbox" id="editbox${x.id}" style="display:none;margin-top:6px">
+<div class="editbox" id="editbox${x.id}" style="display:none">
 <input type="text" id="etitre${x.id}" value="${esc(x.titre)}" placeholder="Titre">
-<input type="text" id="ecat${x.id}" value="${esc(x.categorie||'')}" placeholder="Catégorie">
+<select id="edossier${x.id}">${optionsDossiers(x.dossier_id)}</select>
 <button onclick="saveEditFeed(${x.id})">💾</button>
 <button onclick="toggleEdit(${x.id})">Annuler</button>
 </div></div>
 <button onclick="toggleEdit(${x.id})">✏️</button>
 <button onclick="purgeFlux(${x.id},'${esc(x.titre).replace(/'/g,"\\\\'")}')">🧹 Vider</button>
 <button onclick="delFeed(${x.id},'${esc(x.titre).replace(/'/g,"\\\\'")}')">🗑 Supprimer</button></div>`).join('')
-:'<p>Aucun flux. Ajoutez-en un ci-dessous ou importez un OPML.</p>';}
+:'<p>Aucun flux. Ajoutez-en un ci-dessous ou importez un OPML.</p>';
+document.getElementById('fdossier').innerHTML=optionsDossiers(null);
+document.getElementById('gndossier').innerHTML=optionsDossiers(null);}
+
+async function refreshFeeds(){await loadFeeds();await chargerBarreLaterale();}
+
+/* ─── GÉNÉRATEUR DE FLUX GOOGLE NEWS ─── */
+
+function urlGoogleNews(query,langRegion){
+const[hl,gl]=langRegion.split('|');
+const ceid=gl+':'+hl.split('-')[0];
+return `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=${hl}&gl=${gl}&ceid=${ceid}`;}
+
+async function ajouterFluxGoogleNews(){
+const q=document.getElementById('gnquery').value.trim();
+if(!q){show('Entrez un mot-clé de recherche.');return;}
+const url=urlGoogleNews(q,document.getElementById('gnlang').value);
+const dv=document.getElementById('gndossier').value;
+const r=await fetch('/api/feeds/add',{method:'POST',
+body:JSON.stringify({url:url,titre:'Google News : '+q,dossier_id:dv||null})});
+const j=await r.json();show(j.message);
+if(j.ok){document.getElementById('gnquery').value='';refreshFeeds();}}
 
 function toggleEdit(id){const b=document.getElementById('editbox'+id);
-b.style.display=b.style.display==='none'?'block':'none';}
+b.style.display=b.style.display==='none'?'flex':'none';}
 
 async function saveEditFeed(id){
 const titre=document.getElementById('etitre'+id).value;
-const cat=document.getElementById('ecat'+id).value;
+const dv=document.getElementById('edossier'+id).value;
 const r=await fetch('/api/feeds/edit',{method:'POST',
-body:JSON.stringify({id:id,titre:titre,categorie:cat})});
-const j=await r.json();show(j.message);loadFeeds();}
+body:JSON.stringify({id:id,titre:titre,dossier_id:dv||null})});
+const j=await r.json();show(j.message);refreshFeeds();}
 
 async function delFeedsBulk(){
 const ids=[...document.querySelectorAll('.fdelchk:checked')].map(c=>+c.value);
@@ -804,41 +1330,30 @@ if(!confirm('Supprimer les '+ids.length+' flux sélectionnés ?'))return;
 const wipe=confirm('Effacer AUSSI leurs articles archivés ?\\nOK = effacer, Annuler = conserver');
 const r=await fetch('/api/feeds/delete-bulk',{method:'POST',
 body:JSON.stringify({ids:ids,purge:wipe})});const j=await r.json();
-show(j.message);loadFeeds();load();}
+show(j.message);refreshFeeds();load();}
 
 async function addFeed(){
+const dv=document.getElementById('fdossier').value;
 const body=JSON.stringify({url:document.getElementById('furl').value,
-titre:document.getElementById('ftitre').value,
-categorie:document.getElementById('fcat').value});
+titre:document.getElementById('ftitre').value,dossier_id:dv||null});
 const r=await fetch('/api/feeds/add',{method:'POST',body:body});const j=await r.json();
 show(j.message);if(j.ok){document.getElementById('furl').value='';
-document.getElementById('ftitre').value='';document.getElementById('fcat').value='';loadFeeds();}}
+document.getElementById('ftitre').value='';refreshFeeds();}}
 
 async function delFeed(id,titre){
 if(!confirm('Supprimer le flux « '+titre+' » ?'))return;
 const wipe=confirm('Effacer AUSSI ses articles archivés ?\\nOK = effacer, Annuler = conserver');
 const r=await fetch('/api/feeds/delete',{method:'POST',
 body:JSON.stringify({id:id,purge:wipe})});const j=await r.json();
-show(j.message);loadFeeds();load();}
+show(j.message);refreshFeeds();load();}
 
 async function purgeFlux(id,titre){
 if(!confirm('Vider tous les articles de « '+titre+' » ?\\n(Le flux reste abonné.)'))return;
 const r=await fetch('/api/purge/flux',{method:'POST',
 body:JSON.stringify({id:id})});const j=await r.json();
-show(j.message);loadFeeds();load();}
+show(j.message);refreshFeeds();load();}
 
-async function loadFiltreFlux(){const r=await fetch('/api/feeds');const f=await r.json();
-document.getElementById('filtrefluxlist').innerHTML=f.map(x=>
-`<label><input type="checkbox" class="fltchk" value="${x.id}" ${fluxFiltre.has(x.id)?'checked':''} onchange="toggleFiltreFlux(${x.id},this.checked)"> ${esc(x.titre)}${x.categorie?' · '+esc(x.categorie):''}</label>`).join('');}
-
-function toggleFiltreFlux(id,checked){
-if(checked)fluxFiltre.add(id);else fluxFiltre.delete(id);
-load();}
-
-function filtreFluxTout(sel){
-document.querySelectorAll('.fltchk').forEach(cb=>{cb.checked=sel;
-if(sel)fluxFiltre.add(+cb.value);else fluxFiltre.delete(+cb.value);});
-load();}
+/* ─── PURGES / RÉGLAGES ─── */
 
 async function purgePeriode(){const[s,e]=bornes();
 if(!confirm('Effacer tous les articles de la période '+s+' → '+e+' ?'))return;
@@ -880,10 +1395,13 @@ const r=await fetch('/api/reglages/prompt',{method:'POST',
 body:JSON.stringify({prompt:''})});const j=await r.json();
 show('Prompt par défaut rétabli.');loadReglages();}
 
-(async()=>{const r=await fetch('/api/reglages');const j=await r.json();
+(async()=>{
+await chargerBarreLaterale();
+const r=await fetch('/api/reglages');const j=await r.json();
 mailDefaut=j.mail;
 motsCles=(j.motscles||'').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-load();})();
+load();
+})();
 </script></body></html>"""
 
 # ==================== SERVEUR HTTP ====================
@@ -906,15 +1424,28 @@ class H(BaseHTTPRequestHandler):
         feeds_param = q.get("feeds", [None])[0]
         feed_ids = ([int(x) for x in feeds_param.split(",") if x.strip().isdigit()]
                     if feeds_param else None)
-        return u, start, end, feed_ids
+        article_id = q.get("id", [None])[0]
+        return u, start, end, feed_ids, article_id
+
+    @staticmethod
+    def _dossier_id_de(d):
+        v = d.get("dossier_id")
+        if v in (None, "", "null"):
+            return None
+        try: return int(v)
+        except (TypeError, ValueError): return None
 
     def do_GET(self):
-        u, start, end, feed_ids = self._params()
+        u, start, end, feed_ids, article_id = self._params()
         if u.path == "/": self._send(PAGE)
         elif u.path == "/api/articles":
             self._json(articles_periode(start, end, feed_ids))
         elif u.path == "/api/feeds":
             self._json(list_feeds())
+        elif u.path == "/api/dossiers":
+            self._json(list_dossiers())
+        elif u.path == "/api/article/texte":
+            self._json(obtenir_texte_article(int(article_id or 0)))
         elif u.path == "/api/reglages":
             self._json({"prompt": get_reglage("prompt_analyse", PROMPT_ANALYSE_DEFAUT),
                         "mail": get_reglage("mail_defaut", ""),
@@ -928,9 +1459,9 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/export/csv":
             s, e = borne_periode(start, end)
             buf = io.StringIO(); w = csv.writer(buf, delimiter=";")
-            w.writerow(["titre","lien","resume","date","flux","categorie","lu"])
+            w.writerow(["titre","lien","resume","date","flux","lu"])
             for a in articles_periode(s, e, feed_ids):
-                w.writerow([a["titre"],a["lien"],a["resume"],a["date"],a["flux"],a["categorie"],
+                w.writerow([a["titre"],a["lien"],a["resume"],a["date"],a["flux"],
                            "oui" if a["lu"] else "non"])
             self._send("\ufeff"+buf.getvalue(), "text/csv; charset=utf-8",
                        f"articles_{s}_{e}.csv")
@@ -947,7 +1478,7 @@ class H(BaseHTTPRequestHandler):
         else: self.send_error(404)
 
     def do_POST(self):
-        u, start, end, feed_ids = self._params()
+        u, start, end, feed_ids, article_id = self._params()
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
         def jbody():
@@ -961,11 +1492,11 @@ class H(BaseHTTPRequestHandler):
             self._json({"ok": ok, "message": msg if not ok else "OK"})
         elif u.path == "/api/feeds/add":
             d = jbody()
-            ok, msg = add_feed(d.get("url",""), d.get("titre",""), d.get("categorie",""))
+            ok, msg = add_feed(d.get("url",""), d.get("titre",""), self._dossier_id_de(d))
             self._json({"ok": ok, "message": msg})
         elif u.path == "/api/feeds/edit":
             d = jbody()
-            ok, msg = edit_feed(int(d.get("id", 0)), d.get("titre",""), d.get("categorie",""))
+            ok, msg = edit_feed(int(d.get("id", 0)), d.get("titre",""), self._dossier_id_de(d))
             self._json({"ok": ok, "message": msg})
         elif u.path == "/api/feeds/delete":
             d = jbody()
@@ -975,10 +1506,33 @@ class H(BaseHTTPRequestHandler):
             d = jbody()
             ok, msg = delete_feeds_bulk(d.get("ids", []), bool(d.get("purge", False)))
             self._json({"ok": ok, "message": msg})
+        elif u.path == "/api/feeds/reorder":
+            d = jbody()
+            reordonner_feeds(self._dossier_id_de(d), d.get("ids", []))
+            self._json({"ok": True})
+        elif u.path == "/api/dossiers/add":
+            d = jbody()
+            ok, msg, did = ajouter_dossier(d.get("nom",""))
+            self._json({"ok": ok, "message": msg, "id": did})
+        elif u.path == "/api/dossiers/rename":
+            d = jbody()
+            ok, msg = renommer_dossier(int(d.get("id", 0)), d.get("nom",""))
+            self._json({"ok": ok, "message": msg})
+        elif u.path == "/api/dossiers/delete":
+            d = jbody()
+            ok, msg = supprimer_dossier(int(d.get("id", 0)))
+            self._json({"ok": ok, "message": msg})
+        elif u.path == "/api/dossiers/reorder":
+            d = jbody()
+            reordonner_dossiers(d.get("ids", []))
+            self._json({"ok": True})
         elif u.path == "/api/articles/lu":
             d = jbody()
             marquer_lu(int(d.get("id", 0)), bool(d.get("lu", False)))
             self._json({"ok": True})
+        elif u.path == "/api/article/texte/recharger":
+            d = jbody()
+            self._json(obtenir_texte_article(int(d.get("id", 0)), forcer=True))
         elif u.path == "/api/opml/preview":
             try:
                 nouveaux, a_supprimer = opml_preview(body)
@@ -1020,6 +1574,6 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     db().close()
-    print(f"RSSLocal v4 démarré → http://localhost:{PORT}  (Ctrl+C pour arrêter)")
+    print(f"RSSLocal v5 démarré → http://localhost:{PORT}  (Ctrl+C pour arrêter)")
     threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
     HTTPServer(("127.0.0.1", PORT), H).serve_forever()
